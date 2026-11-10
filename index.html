@@ -89,16 +89,20 @@
         <label>Дата закупа<input name="buyDate" type="date"></label>
       </div>
       <div class="row">
+        <label>Кто платил<select name="buyer" data-list="partners"></select></label>
         <label>У кого куплено<input name="seller" autocomplete="off"></label>
-        <label>Документ закупа<input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
       </div>
+      <label>Документ закупа<input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
       <label>Цена продажи план, ₽<input name="planPrice" type="number" inputmode="numeric" min="0" step="1"></label>
       <p id="markup-hint" class="hint"></p>
-      <fieldset id="sale-fields" hidden>
-        <label>Статус<select name="status" data-list="status"></select></label>
-        <div class="row" id="sale-row">
-          <label>Цена продажи, ₽<input name="salePrice" type="number" inputmode="numeric" min="0" step="1"></label>
-          <label>Дата продажи<input name="saleDate" type="date"></label>
+      <fieldset id="sale-fields">
+        <label>Статус<select name="status"></select></label>
+        <div id="sale-row">
+          <div class="row">
+            <label>Цена продажи, ₽<input name="salePrice" type="number" inputmode="numeric" min="0" step="1"></label>
+            <label>Дата продажи<input name="saleDate" type="date"></label>
+          </div>
+          <label>Деньги получил<select name="soldBy" data-list="partners"></select></label>
         </div>
       </fieldset>
       <label>Заметки<textarea name="notes" rows="3" maxlength="1000"></textarea></label>
@@ -114,14 +118,29 @@
   <section id="view-stats" class="view" hidden>
     <button class="back" type="button" data-back>‹ Назад</button>
     <h2>Статистика</h2>
-    <div id="stats-tiles" class="tiles"></div>
-    <h3 class="section-title">Прибыль по месяцам</h3>
-    <div id="stats-chart" class="chart"></div>
-    <div id="stats-months" class="table-wrap"></div>
-    <h3 class="section-title">По категориям (продано)</h3>
-    <div id="stats-cats" class="table-wrap"></div>
-    <h3 class="section-title">Долго лежат</h3>
-    <ul id="stats-stale" class="items"></ul>
+    <div class="tabs stats-switch" role="tablist">
+      <button type="button" role="tab" data-stats-tab="general" aria-selected="true">Общая</button>
+      <button type="button" role="tab" data-stats-tab="partners" aria-selected="false">Партнёры</button>
+    </div>
+    <div id="stats-general">
+      <div id="stats-tiles" class="tiles"></div>
+      <h3 class="section-title">Прибыль по месяцам</h3>
+      <div id="stats-chart" class="chart"></div>
+      <div id="stats-months" class="table-wrap"></div>
+      <h3 class="section-title">По категориям (продано)</h3>
+      <div id="stats-cats" class="table-wrap"></div>
+      <h3 class="section-title">Долго лежат</h3>
+      <ul id="stats-stale" class="items"></ul>
+    </div>
+    <div id="stats-partners" hidden>
+      <div id="partner-period" class="chips period-chips"></div>
+      <div id="partner-cards" class="partner-cards"></div>
+      <div id="partner-unknown"></div>
+      <h3 class="section-title">Взаиморасчёт поровну</h3>
+      <div id="partner-settle"></div>
+      <p class="muted settle-note">Считается за всё время: всё, что каждый заплатил за закупки и получил от продаж, делится пополам.
+        Деньги в непроданных вещах тоже учитываются как вложение.</p>
+    </div>
   </section>
 
   <!-- Продажа -->
@@ -130,7 +149,10 @@
       <h3 id="sell-h">Отметить «Продано»</h3>
       <p id="sell-title" class="muted"></p>
       <label>Цена продажи, ₽ *<input name="salePrice" type="number" inputmode="numeric" min="0" step="1" required></label>
-      <label>Дата продажи<input name="saleDate" type="date"></label>
+      <div class="row">
+        <label>Дата продажи<input name="saleDate" type="date"></label>
+        <label>Деньги получил<select name="soldBy" data-list="partners"></select></label>
+      </div>
       <p id="sell-profit" class="hint"></p>
       <p id="sell-error" class="error" role="alert"></p>
       <div class="actions">

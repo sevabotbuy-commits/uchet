@@ -6,8 +6,8 @@
 
 const tg = window.Telegram && window.Telegram.WebApp;
 const DEMO = new URLSearchParams(location.search).has('demo');
-const STATUS = { inStock: 'В наличии', reserved: 'Бронь', sold: 'Продано' };
-const TABS = [STATUS.inStock, STATUS.reserved, STATUS.sold, 'Все'];
+const STATUS = { inTransit: 'В пути', inStock: 'В наличии', reserved: 'Бронь', sold: 'Продано' };
+const TABS = [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold, 'Все'];
 const STALE_DAYS = 60;          // «долго лежит»
 const AUTO_REFRESH_MS = 60000;  // при возврате в приложение обновлять, если данные старше минуты
 const CACHE_KEY = DEMO ? 'uv.demo.cache' : 'uv.cache';
@@ -17,12 +17,16 @@ const DEFAULT_LISTS = {
   condition: ['Новое с бирками', 'Отличное', 'Хорошее', 'Есть следы носки'],
   source: ['Выкуп', 'Комиссия'],
   authenticity: ['Не проверено', 'Проверено', 'Есть сомнения'],
-  status: [STATUS.inStock, STATUS.reserved, STATUS.sold],
+  status: [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold],
 };
 
 const state = {
   items: [],
   lists: { ...DEFAULT_LISTS },
+  user: null,         // { id, name } — кто открыл приложение
+  partners: [],       // имена партнёров для «Кто платил» / «Деньги получил»
+  statsTab: 'general',
+  partnerPeriod: 'month',
   tab: STATUS.inStock,
   category: '',
   query: '',
@@ -230,6 +234,10 @@ function setLoading(on) {
   $('#btn-refresh').classList.toggle('spin', on);
 }
 
+function saveCache() {
+  storage.set(CACHE_KEY, { items: state.items, lists: state.lists, user: state.user, partners: state.partners, at: state.lastLoad });
+}
+
 async function loadItems({ silent = false } = {}) {
   if (state.loading) return;
   setLoading(true);
@@ -237,7 +245,7 @@ async function loadItems({ silent = false } = {}) {
   try {
     state.items = await api('list');
     state.lastLoad = Date.now();
-    storage.set(CACHE_KEY, { items: state.items, lists: state.lists, at: state.lastLoad });
+    saveCache();
     // Миниатюры могли поменяться — забываем те, у которых больше нет фото.
     state.items.forEach((i) => { if (!i.hasPhoto) { state.photos.delete(i.id); state.fullPhotos.delete(i.id); } });
     refreshCurrentView();
@@ -307,12 +315,15 @@ function monthSales(offset = 0) {
 }
 
 function renderSummary() {
-  const inStock = state.items.filter((i) => i.status !== STATUS.sold);
-  const stockCost = inStock.reduce((s, i) => s + (i.buyPrice || 0), 0);
+  const unsold = state.items.filter((i) => i.status !== STATUS.sold);
+  const transit = unsold.filter((i) => i.status === STATUS.inTransit).length;
+  const invested = unsold.reduce((s, i) => s + (i.buyPrice || 0), 0);
   const sold = monthSales();
   const profit = sold.reduce((s, i) => s + (profitOf(i) || 0), 0);
   $('#summary').replaceChildren(
-    'На руках ', el('b', {}, pieces(inStock.length)), ' на ', el('b', {}, rub(stockCost)), el('br'),
+    'Не продано ', el('b', {}, pieces(unsold.length)),
+    ...(transit ? [' (в пути ', el('b', {}, transit), ')'] : []),
+    ', вложено ', el('b', {}, rub(invested)), el('br'),
     'В этом месяце продано ', el('b', {}, pieces(sold.length)), ', прибыль ',
     el('b', { class: profit < 0 ? 'profit-minus' : '' }, signedRub(profit)), '  ›',
   );
@@ -338,7 +349,8 @@ function filtered() {
       if (state.tab !== 'Все' && i.status !== state.tab) return false;
       if (state.category && i.category !== state.category) return false;
       if (!words.length) return true;
-      const hay = [i.title, i.brand, i.size, i.category, i.notes, i.id, i.consignor, i.seller].join(' ').toLowerCase();
+      const hay = [i.title, i.brand, i.size, i.category, i.notes, i.id, i.consignor, i.seller, i.buyer, i.soldBy]
+        .join(' ').toLowerCase();
       return words.every((w) => hay.includes(w));
     })
     .sort(SORTS[state.sort] || SORTS.new);
@@ -349,6 +361,7 @@ function itemRow(item, onClick) {
   if (item.hasPhoto) lazyPhoto(item.id, thumb);
   const p = profitOf(item);
   const tags = [];
+  if (item.status === STATUS.inTransit && state.tab !== STATUS.inTransit) tags.push(el('span', { class: 'badge info' }, 'В пути'));
   if (item.status === STATUS.reserved) tags.push(el('span', { class: 'badge warn' }, 'Бронь'));
   if (item.source === 'Комиссия') tags.push(el('span', { class: 'badge info' }, 'Комиссия'));
   if (isStale(item)) tags.push(el('span', { class: 'badge' }, `${daysHeld(item)} дн.`));
@@ -481,11 +494,14 @@ function openLightbox() {
 const ITEM_FIELDS = [
   ['category', 'Категория'], ['brand', 'Бренд'], ['size', 'Размер'], ['condition', 'Состояние'],
   ['authenticity', 'Подлинность'], ['source', 'Источник'], ['consignor', 'Комитент'],
-  ['buyPrice', 'Закуп', rub], ['buyDate', 'Дата закупа'], ['seller', 'У кого куплено'], ['buyDoc', 'Документ'],
-  ['planPrice', 'План продажи', rub], ['salePrice', 'Продано за', rub], ['saleDate', 'Дата продажи'],
-  ['notes', 'Заметки'], ['addedBy', 'Добавил'], ['changedBy', 'Изменил'], ['changedAt', 'Изменено'], ['id', 'ID'],
+  ['buyPrice', 'Закуп', rub], ['buyDate', 'Дата закупа'], ['buyer', 'Кто платил'], ['seller', 'У кого куплено'],
+  ['buyDoc', 'Документ'], ['planPrice', 'План продажи', rub], ['salePrice', 'Продано за', rub], ['saleDate', 'Дата продажи'],
+  ['soldBy', 'Деньги получил'], ['notes', 'Заметки'], ['addedBy', 'Добавил'], ['changedBy', 'Изменил'],
+  ['changedAt', 'Изменено'], ['id', 'ID'],
 ];
-const STATUS_CLASS = { [STATUS.inStock]: 's-instock', [STATUS.reserved]: 's-reserved', [STATUS.sold]: 's-sold' };
+const STATUS_CLASS = {
+  [STATUS.inTransit]: 's-transit', [STATUS.inStock]: 's-instock', [STATUS.reserved]: 's-reserved', [STATUS.sold]: 's-sold',
+};
 
 function openItem(id, opts) {
   const item = state.items.find((i) => i.id === id);
@@ -540,7 +556,13 @@ function openItem(id, opts) {
   $('#item-fields').replaceChildren(...rows);
 
   const actions = [];
-  if (item.status !== STATUS.sold) actions.push(el('button', { type: 'button', class: 'primary', onclick: openSell }, 'Продано'));
+  const btn = (text, onclick, cls) => el('button', { type: 'button', class: cls, onclick }, text);
+  if (item.status === STATUS.inTransit) {
+    // Главное действие для едущей вещи — отметить получение; продать/забронировать можно и заранее.
+    actions.push(btn('Получена', () => changeStatus(STATUS.inStock), 'primary wide-row'));
+    actions.push(btn('Продано', openSell), btn('В бронь', () => changeStatus(STATUS.reserved)));
+  }
+  if (item.status === STATUS.inStock || item.status === STATUS.reserved) actions.push(btn('Продано', openSell, 'primary'));
   if (item.status === STATUS.inStock) actions.push(el('button', { type: 'button', onclick: () => changeStatus(STATUS.reserved) }, 'В бронь'));
   if (item.status === STATUS.reserved) actions.push(el('button', { type: 'button', onclick: () => changeStatus(STATUS.inStock) }, 'Снять бронь'));
   if (item.status === STATUS.sold) actions.push(el('button', { type: 'button', onclick: () => changeStatus(STATUS.inStock) }, 'Вернуть в наличие'));
@@ -573,7 +595,7 @@ async function changeStatus(status) {
   try {
     await api('setStatus', { id: item.id, status, version: item.changedAt });
     haptic('success');
-    toast(`Статус: ${status}`);
+    toast(item.status === STATUS.inTransit && status === STATUS.inStock ? 'Получена — теперь в наличии ✓' : `Статус: ${status}`);
     await loadItems({ silent: true });
   } catch (e) { handleWriteError(e); }
 }
@@ -595,6 +617,7 @@ function openSell() {
   f.reset();
   f.salePrice.value = isNum(state.current.planPrice) ? state.current.planPrice : '';
   f.saleDate.value = todayIso();
+  fillPartnerSelect(f.soldBy, myName());
   $('#sell-title').textContent = state.current.title;
   $('#sell-error').textContent = '';
   updateSellProfit();
@@ -623,7 +646,10 @@ async function submitSell(e) {
   btn.disabled = true;
   try {
     const item = state.current;
-    await api('sell', { id: item.id, salePrice: Number(f.salePrice.value), saleDate: f.saleDate.value, version: item.changedAt });
+    await api('sell', {
+      id: item.id, salePrice: Number(f.salePrice.value), saleDate: f.saleDate.value,
+      soldBy: f.soldBy.value, version: item.changedAt,
+    });
     haptic('success');
     $('#sell-sheet').hidden = true;
     toast('Продано ✓');
@@ -636,16 +662,27 @@ async function submitSell(e) {
 // ---------------------------------------------------------------- форма (добавить / изменить)
 
 const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'condition', 'source', 'authenticity', 'consignor',
-  'buyPrice', 'buyDate', 'seller', 'buyDoc', 'planPrice', 'notes'];
+  'buyPrice', 'buyDate', 'buyer', 'seller', 'buyDoc', 'planPrice', 'notes'];
 const CLONE_FIELDS = ['title', 'category', 'brand', 'condition', 'source', 'authenticity', 'consignor',
-  'buyPrice', 'seller', 'buyDoc', 'planPrice'];
+  'buyPrice', 'buyer', 'seller', 'buyDoc', 'planPrice'];
+
+const myName = () => (state.user && state.user.name) || '';
+/** Партнёры для выпадающих списков: я первым, затем остальные. */
+function partnerList() {
+  const all = [myName(), ...state.partners].filter(Boolean);
+  return all.filter((n, i) => all.indexOf(n) === i);
+}
+function fillPartnerSelect(sel, value) {
+  sel.replaceChildren(el('option', { value: '' }, '— не указано'), ...partnerList().map((n) => el('option', { value: n }, n)));
+  setField(sel.form, sel.name, value);
+}
 
 function fillSelects() {
   document.querySelectorAll('select[data-list]').forEach((sel) => {
-    const values = state.lists[sel.dataset.list] || [];
+    const values = sel.dataset.list === 'partners' ? partnerList() : (state.lists[sel.dataset.list] || []);
     const keep = sel.value;
     sel.replaceChildren(
-      ...(sel.dataset.list === 'status' ? [] : [el('option', { value: '' }, '—')]),
+      el('option', { value: '' }, sel.dataset.list === 'partners' ? '— не указано' : '—'),
       ...values.map((v) => el('option', { value: v }, v)),
     );
     sel.value = keep;
@@ -685,9 +722,13 @@ function openForm(mode, source) {
   state.form = { mode, photo: null, removePhoto: false, dirty: false, hadPhoto: false };
   $('#form-error').textContent = '';
   $('#btn-delete').hidden = mode !== 'edit';
-  $('#sale-fields').hidden = mode !== 'edit';
   $('#form-title').textContent = mode === 'edit' ? 'Изменить вещь' : 'Новая вещь';
   setFormPhoto(null);
+  // Статус: при добавлении — только «В наличии» или «В пути», при правке — все.
+  const statuses = mode === 'edit'
+    ? [...new Set([...DEFAULT_LISTS.status, ...(state.lists.status || [])])]
+    : [STATUS.inStock, STATUS.inTransit];
+  f.status.replaceChildren(...statuses.map((s) => el('option', { value: s }, s)));
 
   if (mode === 'edit') {
     const item = state.current;
@@ -696,6 +737,7 @@ function openForm(mode, source) {
     setField(f, 'status', item.status);
     setField(f, 'salePrice', item.salePrice);
     setField(f, 'saleDate', ruToIso(item.saleDate) || todayIso());
+    setField(f, 'soldBy', item.soldBy || (item.status === STATUS.sold ? '' : myName()));
     state.form.hadPhoto = item.hasPhoto;
     if (item.hasPhoto) {
       const src = state.fullPhotos.get(item.id) || state.photos.get(item.id);
@@ -717,6 +759,8 @@ function openForm(mode, source) {
     if (!f.source.value && state.lists.source.includes('Выкуп')) f.source.value = 'Выкуп';
     if (!f.authenticity.value && state.lists.authenticity.includes('Не проверено')) f.authenticity.value = 'Не проверено';
     if (!f.category.value && state.category) f.category.value = state.category;
+    if (!f.buyer.value) setField(f, 'buyer', myName());
+    f.status.value = state.tab === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock;
   }
   syncFormExtras();
   show('form');
@@ -801,10 +845,12 @@ function collectForm() {
   const f = $('#item-form');
   const data = {};
   FORM_FIELDS.forEach((k) => { data[k] = f.elements[k].value.trim(); });
+  data.status = f.status.value;
   if (state.form.mode === 'edit') {
-    data.status = f.status.value;
-    data.salePrice = data.status === STATUS.sold ? f.salePrice.value : '';
-    data.saleDate = data.status === STATUS.sold ? f.saleDate.value : '';
+    const sold = data.status === STATUS.sold;
+    data.salePrice = sold ? f.salePrice.value : '';
+    data.saleDate = sold ? f.saleDate.value : '';
+    data.soldBy = sold ? f.soldBy.value : '';
   }
   return data;
 }
@@ -843,8 +889,8 @@ async function submitForm(e) {
       state.form.dirty = false;
       storage.del(DRAFT_KEY);
       haptic('success');
-      toast('Вещь добавлена ✓');
-      state.tab = STATUS.inStock;
+      toast(data.status === STATUS.inTransit ? 'Добавлена во «В пути» ✓' : 'Вещь добавлена ✓');
+      state.tab = data.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock;
       state.query = '';
       $('#search').value = '';
       show('list');
@@ -890,12 +936,143 @@ function median(arr) {
   return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
 }
 
-function openStats() {
+function openStats(tab) {
+  if (typeof tab === 'string') state.statsTab = tab;
   show('stats');
   renderStats();
 }
 
 function renderStats() {
+  document.querySelectorAll('[data-stats-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.statsTab === state.statsTab)));
+  $('#stats-general').hidden = state.statsTab !== 'general';
+  $('#stats-partners').hidden = state.statsTab !== 'partners';
+  if (state.statsTab === 'partners') renderPartners(); else renderGeneralStats();
+}
+
+// ---------------------------------------------------------------- партнёры
+
+const PERIODS = [['month', 'Этот месяц'], ['prev', 'Прошлый месяц'], ['all', 'Всё время']];
+
+function inPeriod(ruDate, period) {
+  if (period === 'all') return true;
+  const d = parseRuDate(ruDate);
+  if (!d) return false;
+  const now = new Date();
+  const ref = new Date(now.getFullYear(), now.getMonth() - (period === 'prev' ? 1 : 0), 1);
+  return d.getMonth() === ref.getMonth() && d.getFullYear() === ref.getFullYear();
+}
+
+/** Суммы закупок и продаж по партнёрам за период. Ключ '' — «не указано». */
+function partnerTotals(period) {
+  const t = new Map();
+  const get = (name) => {
+    if (!t.has(name)) t.set(name, { name, buy: 0, buyCount: 0, sale: 0, saleCount: 0 });
+    return t.get(name);
+  };
+  partnerList().forEach(get);
+  state.items.forEach((i) => {
+    if (isNum(i.buyPrice) && i.buyPrice > 0 && inPeriod(i.buyDate, period)) {
+      const r = get(i.buyer || '');
+      r.buy += i.buyPrice; r.buyCount++;
+    }
+    if (i.status === STATUS.sold && isNum(i.salePrice) && inPeriod(i.saleDate, period)) {
+      const r = get(i.soldBy || '');
+      r.sale += i.salePrice; r.saleCount++;
+    }
+  });
+  return t;
+}
+
+/**
+ * Взаиморасчёт поровну за всё время (без комиссионных вещей — их выручка не наша).
+ * Каждый: получил от продаж − заплатил за закупки = «на руках». Поровну — это общий итог / число партнёров.
+ * Кто держит больше своей доли — переводит разницу тем, у кого меньше.
+ */
+function settlement() {
+  const net = new Map();
+  let skipped = 0;
+  const add = (name, v) => net.set(name, (net.get(name) || 0) + v);
+  state.items.forEach((i) => {
+    if (i.source === 'Комиссия') return;
+    if (isNum(i.buyPrice) && i.buyPrice > 0) { if (i.buyer) add(i.buyer, -i.buyPrice); else skipped++; }
+    if (i.status === STATUS.sold && isNum(i.salePrice)) { if (i.soldBy) add(i.soldBy, i.salePrice); else skipped++; }
+  });
+  partnerList().forEach((n) => { if (!net.has(n)) net.set(n, 0); });
+  const names = [...net.keys()];
+  const total = names.reduce((s, n) => s + net.get(n), 0);
+  const share = names.length ? total / names.length : 0;
+  const bal = names.map((n) => ({ name: n, owe: Math.round(net.get(n) - share) }));
+  const transfers = [];
+  const payers = bal.filter((b) => b.owe > 0).sort((a, b) => b.owe - a.owe);
+  const takers = bal.filter((b) => b.owe < 0).sort((a, b) => a.owe - b.owe);
+  for (const p of payers) {
+    for (const t of takers) {
+      if (p.owe <= 0) break;
+      const amount = Math.min(p.owe, -t.owe);
+      if (amount > 0) { transfers.push({ from: p.name, to: t.name, amount }); p.owe -= amount; t.owe += amount; }
+    }
+  }
+  return { names, total, share, transfers, skipped };
+}
+
+function renderPartners() {
+  $('#partner-period').replaceChildren(...PERIODS.map(([key, label]) => el('button', {
+    type: 'button', 'aria-pressed': String(state.partnerPeriod === key),
+    onclick: () => { state.partnerPeriod = key; haptic('tap'); renderPartners(); },
+  }, label)));
+
+  const totals = partnerTotals(state.partnerPeriod);
+  const unknown = totals.get('');
+  totals.delete('');
+  const cards = [...totals.values()];
+  const box = $('#partner-cards');
+  box.classList.toggle('single', cards.length < 2);
+  box.replaceChildren(...cards.map((c) => {
+    const diff = c.sale - c.buy;
+    return el('div', { class: 'partner-card' + (c.name === myName() ? ' me' : '') },
+      el('div', { class: 'partner-name' }, c.name, c.name === myName() ? el('span', { class: 'badge info' }, 'вы') : null),
+      el('div', { class: 'partner-row' }, el('span', {}, 'Закупил'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
+      el('div', { class: 'partner-row' }, el('span', {}, 'Продал'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
+      el('div', { class: 'partner-row total' }, el('span', {}, 'Разница'),
+        el('b', { class: diff < 0 ? 'profit-minus' : diff > 0 ? 'profit-plus' : '' }, signedRub(diff))));
+  }));
+  if (cards.length < 2) {
+    box.append(el('p', { class: 'muted' }, 'Второй партнёр появится здесь, когда его Telegram ID будет в ALLOWED_IDS и он откроет бота, '
+      + 'или когда его имя будет указано в «Кто платил» / «Деньги получил».'));
+  }
+
+  // Вещи без партнёра — с подсказкой и списком
+  const unk = $('#partner-unknown');
+  const missing = state.items.filter((i) => (isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer)
+    || (i.status === STATUS.sold && isNum(i.salePrice) && !i.soldBy));
+  if (missing.length) {
+    const sums = unknown ? `За период: закупки ${rub(unknown.buy)}, продажи ${rub(unknown.sale)}. ` : '';
+    const list = el('ul', { class: 'items', hidden: true }, missing.slice(0, 30).map((i) => itemRow(i)));
+    unk.replaceChildren(el('div', { class: 'notice' },
+      el('b', {}, `Не указан партнёр: ${pieces(missing.length)}`),
+      el('p', {}, `${sums}Откройте вещь → «Изменить» → «Кто платил» / «Деньги получил».`),
+      el('button', { type: 'button', class: 'link-btn', onclick: (e) => { list.hidden = !list.hidden; e.target.textContent = list.hidden ? 'Показать вещи' : 'Скрыть'; } }, 'Показать вещи'),
+      list));
+  } else unk.replaceChildren();
+
+  const s = settlement();
+  const settle = $('#partner-settle');
+  if (s.names.length < 2) {
+    settle.replaceChildren(el('p', { class: 'muted' }, 'Расчёт появится, когда в учёте будут два партнёра.'));
+  } else {
+    const head = s.transfers.length
+      ? [el('div', { class: 'muted' }, 'Кто кому переводит, чтобы всё было поровну:'),
+        ...s.transfers.map((t) => el('div', { class: 'settle-transfer' },
+          el('b', {}, t.from), el('span', { class: 'arrow' }, ' → '), el('b', {}, t.to), el('div', { class: 'settle-amount' }, rub(t.amount))))]
+      : [el('div', { class: 'settle-transfer' }, el('b', {}, 'Вы в расчёте ✓'))];
+    settle.replaceChildren(el('div', { class: 'settle-card' },
+      ...head,
+      el('p', { class: 'muted' }, `Общий результат (продажи − закупки): ${signedRub(s.total)}, доля каждого ${signedRub(Math.round(s.share))}.`
+        + (s.skipped ? ` Без партнёра не учтено записей: ${s.skipped}.` : ''))));
+  }
+}
+
+function renderGeneralStats() {
   const onHand = state.items.filter((i) => i.status !== STATUS.sold);
   const sold = state.items.filter((i) => i.status === STATUS.sold);
   const stockCost = onHand.reduce((s, i) => s + (i.buyPrice || 0), 0);
@@ -913,7 +1090,8 @@ function renderStats() {
   const delta = profitThis - profitPrev;
 
   $('#stats-tiles').replaceChildren(
-    tile('На руках', pieces(onHand.length), `закуп ${rub(stockCost)}`),
+    tile('Не продано', pieces(onHand.length), `вложено ${rub(stockCost)}`
+      + (onHand.some((i) => i.status === STATUS.inTransit) ? `, в пути ${onHand.filter((i) => i.status === STATUS.inTransit).length}` : '')),
     tile('План продаж', rub(planSum), `наценка ${signedRub(potential)}`),
     tile('Продано за месяц', pieces(thisM.length), `выручка ${rub(thisM.reduce((s, i) => s + (i.salePrice || 0), 0))}`),
     tile('Прибыль за месяц', signedRub(profitThis), prevM.length || profitPrev ? `${delta >= 0 ? '▲' : '▼'} ${signedRub(delta)} к прошлому` : 'прошлый месяц — нет продаж',
@@ -1041,13 +1219,15 @@ const demoDb = (() => {
     stamp,
     photos: new Map(), // id → { mime, base64 } — загруженные в демо фото
     items: [
-      { ...base, id: 'd0000001', title: 'Пуховик The North Face Nuptse', category: 'Куртки', brand: 'The North Face', size: 'M', condition: 'Хорошее', source: 'Выкуп', buyPrice: 9000, buyDate: d(140), planPrice: 17000, status: 'Продано', salePrice: 16000, saleDate: d(110), authenticity: 'Проверено' },
-      { ...base, id: 'd0000002', title: 'Кроссовки Nike Dunk Low', category: 'Обувь', brand: 'Nike', size: '42', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 9000, buyDate: d(75), planPrice: 15000, status: 'Продано', salePrice: 14500, saleDate: d(40), authenticity: 'Проверено' },
+      { ...base, id: 'd0000001', title: 'Пуховик The North Face Nuptse', category: 'Куртки', brand: 'The North Face', size: 'M', condition: 'Хорошее', source: 'Выкуп', buyPrice: 9000, buyDate: d(140), planPrice: 17000, status: 'Продано', salePrice: 16000, saleDate: d(110), authenticity: 'Проверено', buyer: 'Антон', soldBy: 'Антон' },
+      { ...base, id: 'd0000002', title: 'Кроссовки Nike Dunk Low', category: 'Обувь', brand: 'Nike', size: '42', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 9000, buyDate: d(75), planPrice: 15000, status: 'Продано', salePrice: 14500, saleDate: d(40), authenticity: 'Проверено', buyer: 'Дима', soldBy: 'Антон' },
       { ...base, id: 'd0000003', title: 'Ремень Gucci GG', category: 'Аксессуары', brand: 'Gucci', size: '90', condition: 'Отличное', source: 'Выкуп', buyPrice: 22000, buyDate: d(95), planPrice: 34000, status: 'В наличии', authenticity: 'Есть сомнения', hasPhoto: false },
       { ...base, id: 'd0000004', title: 'Худи Supreme Box Logo', category: 'Худи', brand: 'Supreme', size: 'M', condition: 'Хорошее', source: 'Комиссия', consignor: 'Иван', buyPrice: null, buyDate: d(20), planPrice: 25000, status: 'Бронь', authenticity: 'Не проверено' },
-      { ...base, id: 'd0000005', title: 'Сумка Prada Re-Edition', category: 'Сумки', brand: 'Prada', size: '', condition: 'Отличное', source: 'Выкуп', buyPrice: 48000, buyDate: d(18), planPrice: 70000, status: 'Продано', salePrice: 52000, saleDate: d(3), authenticity: 'Проверено' },
-      { ...base, id: 'd0000006', title: 'Куртка Stone Island Soft Shell', category: 'Куртки', brand: 'Stone Island', size: 'L', condition: 'Отличное', source: 'Выкуп', buyPrice: 18000, buyDate: d(9), planPrice: 32000, status: 'В наличии', seller: 'Avito', authenticity: 'Проверено' },
-      { ...base, id: 'd0000007', title: 'Футболка Comme des Garçons Play', category: 'Футболки', brand: 'CDG', size: 'S', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 4000, buyDate: d(2), planPrice: 8500, status: 'В наличии', authenticity: 'Проверено' },
+      { ...base, id: 'd0000005', title: 'Сумка Prada Re-Edition', category: 'Сумки', brand: 'Prada', size: '', condition: 'Отличное', source: 'Выкуп', buyPrice: 48000, buyDate: d(18), planPrice: 70000, status: 'Продано', salePrice: 52000, saleDate: d(3), authenticity: 'Проверено', buyer: 'Антон', soldBy: 'Дима' },
+      { ...base, id: 'd0000006', title: 'Куртка Stone Island Soft Shell', category: 'Куртки', brand: 'Stone Island', size: 'L', condition: 'Отличное', source: 'Выкуп', buyPrice: 18000, buyDate: d(9), planPrice: 32000, status: 'В наличии', seller: 'Avito', authenticity: 'Проверено', buyer: 'Дима' },
+      { ...base, id: 'd0000007', title: 'Футболка Comme des Garçons Play', category: 'Футболки', brand: 'CDG', size: 'S', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 4000, buyDate: d(2), planPrice: 8500, status: 'В наличии', authenticity: 'Проверено', buyer: 'Антон' },
+      { ...base, id: 'd0000008', title: 'Кроссовки New Balance 990v6', category: 'Обувь', brand: 'New Balance', size: '43', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 15000, buyDate: d(4), planPrice: 24000, status: 'В пути', seller: 'Poizon', authenticity: 'Не проверено', buyer: 'Дима' },
+      { ...base, id: 'd0000009', title: 'Кепка Stussy', category: 'Аксессуары', brand: 'Stussy', size: 'OS', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 2500, buyDate: d(1), planPrice: 5000, status: 'В пути', authenticity: 'Не проверено', buyer: 'Антон', hasPhoto: false },
     ],
   };
 })();
@@ -1082,7 +1262,7 @@ async function demoApi(action, p) {
   const num = (v) => (v === '' || v === undefined || v === null ? null : Number(v));
   const touch = (it) => { it.changedBy = 'Демо'; it.changedAt = demoDb.stamp() + '.' + Math.random().toString().slice(2, 5); };
   switch (action) {
-    case 'meta': return { user: { id: 0, name: 'Демо' }, lists: { ...DEFAULT_LISTS, category: ['Куртки', 'Худи', 'Обувь', 'Сумки', 'Аксессуары', 'Футболки'] } };
+    case 'meta': return { user: { id: 0, name: 'Антон' }, partners: ['Антон', 'Дима'], lists: { ...DEFAULT_LISTS, category: ['Куртки', 'Худи', 'Обувь', 'Сумки', 'Аксессуары', 'Футболки'] } };
     case 'list': return JSON.parse(JSON.stringify(demoDb.items));
     case 'photo': {
       const it = demoDb.items.find((i) => i.id === p.id);
@@ -1092,7 +1272,7 @@ async function demoApi(action, p) {
     case 'add': {
       const id = Math.random().toString(16).slice(2, 10);
       const it = { ...p, id, buyPrice: num(p.buyPrice), planPrice: num(p.planPrice), buyDate: isoToRu(p.buyDate),
-        status: STATUS.inStock, hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
+        status: p.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock, buyer: p.buyer || 'Антон', hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
       if (p.photo) demoDb.photos.set(id, p.photo);
       delete it.photo;
       touch(it);
@@ -1109,12 +1289,12 @@ async function demoApi(action, p) {
       ['buyPrice', 'planPrice', 'salePrice'].forEach((k) => { if (k in patch) patch[k] = num(patch[k]); });
       ['buyDate', 'saleDate'].forEach((k) => { if (k in patch) patch[k] = isoToRu(patch[k]); });
       Object.assign(it, patch);
-      if (it.status !== STATUS.sold) { it.salePrice = null; it.saleDate = ''; }
+      if (it.status !== STATUS.sold) { it.salePrice = null; it.saleDate = ''; it.soldBy = ''; }
       touch(it);
       return { id: p.id };
     }
-    case 'sell': { const it = find(p.id); Object.assign(it, { status: STATUS.sold, salePrice: p.salePrice, saleDate: isoToRu(p.saleDate) }); touch(it); return { id: p.id }; }
-    case 'setStatus': { const it = find(p.id); Object.assign(it, { status: p.status, salePrice: null, saleDate: '' }); touch(it); return { id: p.id }; }
+    case 'sell': { const it = find(p.id); Object.assign(it, { status: STATUS.sold, salePrice: p.salePrice, saleDate: isoToRu(p.saleDate), soldBy: p.soldBy || 'Антон' }); touch(it); return { id: p.id }; }
+    case 'setStatus': { const it = find(p.id); Object.assign(it, { status: p.status, salePrice: null, saleDate: '', soldBy: '' }); touch(it); return { id: p.id }; }
     case 'delete': { find(p.id); demoDb.items = demoDb.items.filter((i) => i.id !== p.id); return { id: p.id }; }
     default: throw new Error('Неизвестное действие');
   }
@@ -1132,6 +1312,11 @@ function bindEvents() {
   $('#btn-add').addEventListener('click', () => openForm('add'));
   $('#btn-refresh').addEventListener('click', () => loadItems().then(() => toast('Обновлено')).catch((e) => toast(e.message)));
   $('#btn-stats').addEventListener('click', openStats);
+  document.querySelectorAll('[data-stats-tab]').forEach((b) => b.addEventListener('click', () => {
+    state.statsTab = b.dataset.statsTab;
+    haptic('tap');
+    renderStats();
+  }));
   $('#summary').addEventListener('click', openStats);
   document.querySelectorAll('[data-back]').forEach((b) => b.addEventListener('click', goBack));
 
@@ -1215,13 +1400,17 @@ async function init() {
   if (cached && Array.isArray(cached.items)) {
     state.items = cached.items;
     if (cached.lists) state.lists = { ...DEFAULT_LISTS, ...cached.lists };
+    if (cached.user) state.user = cached.user;
+    if (cached.partners) state.partners = cached.partners;
     renderList();
     $('#list-note').textContent = 'Обновляю…';
   }
   try {
     const [meta] = await Promise.all([api('meta'), loadItems({ silent: Boolean(cached) })]);
     state.lists = { ...DEFAULT_LISTS, ...meta.lists };
-    storage.set(CACHE_KEY, { items: state.items, lists: state.lists, at: state.lastLoad });
+    state.user = meta.user || null;
+    state.partners = meta.partners || [];
+    saveCache();
     renderList();
   } catch (e) {
     if (state.items.length && e.code === 'network') {
