@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Учёт вещей</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Список -->
+  <section id="view-list" class="view">
+    <header class="top">
+      <div class="top-row">
+        <h1>Учёт вещей</h1>
+        <div class="top-actions">
+          <button id="btn-stats" class="icon-btn" type="button" aria-label="Статистика" title="Статистика">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7" /></svg>
+          </button>
+          <button id="btn-refresh" class="icon-btn" type="button" aria-label="Обновить" title="Обновить">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>
+          </button>
+        </div>
+      </div>
+      <button id="summary" class="summary" type="button"></button>
+    </header>
+    <div class="search-row">
+      <input id="search" class="search" type="search" placeholder="Поиск" autocomplete="off" enterkeyhint="search">
+      <select id="sort" class="sort" aria-label="Сортировка">
+        <option value="new">Сначала новые</option>
+        <option value="old">Сначала старые</option>
+        <option value="priceDesc">Дороже</option>
+        <option value="priceAsc">Дешевле</option>
+        <option value="stale">Дольше лежат</option>
+      </select>
+    </div>
+    <div id="status-tabs" class="tabs" role="tablist"></div>
+    <div id="cat-chips" class="chips"></div>
+    <p id="list-note" class="muted list-note" aria-live="polite"></p>
+    <ul id="items" class="items"></ul>
+    <button id="btn-add" class="fab" type="button">+ Добавить вещь</button>
+  </section>
+
+  <!-- Карточка вещи -->
+  <section id="view-item" class="view" hidden>
+    <button class="back" type="button" data-back>‹ Назад</button>
+    <button id="item-photo" class="item-photo" type="button" aria-label="Открыть фото"></button>
+    <div class="item-head">
+      <h2 id="item-title"></h2>
+      <span id="item-status" class="status"></span>
+    </div>
+    <p id="item-price" class="item-bigprice"></p>
+    <div id="item-actions" class="actions"></div>
+    <div class="actions secondary-actions">
+      <button id="btn-edit" type="button">Изменить</button>
+      <button id="btn-copy-ad" type="button">Объявление</button>
+      <button id="btn-clone" type="button">Похожая вещь</button>
+    </div>
+    <dl id="item-fields" class="fields"></dl>
+  </section>
+
+  <!-- Добавление / правка -->
+  <section id="view-form" class="view" hidden>
+    <button class="back" type="button" data-back>‹ Назад</button>
+    <h2 id="form-title">Новая вещь</h2>
+    <form id="item-form" novalidate>
+      <div class="photo-pick">
+        <label class="photo-preview" id="photo-preview">
+          <input id="photo-input" type="file" accept="image/*">
+          <span>📷 Добавить фото</span>
+        </label>
+        <button id="photo-remove" type="button" class="link-btn" hidden>Убрать фото</button>
+      </div>
+      <label>Название *<input name="title" required maxlength="200" autocomplete="off"></label>
+      <label>Категория<input name="category" list="dl-category" autocomplete="off"></label>
+      <div class="row">
+        <label>Бренд<input name="brand" list="dl-brand" autocomplete="off"></label>
+        <label>Размер<input name="size" autocomplete="off"></label>
+      </div>
+      <label>Состояние<select name="condition" data-list="condition"></select></label>
+      <div class="row">
+        <label>Источник<select name="source" data-list="source"></select></label>
+        <label>Подлинность<select name="authenticity" data-list="authenticity"></select></label>
+      </div>
+      <label id="consignor-field" hidden>Комитент<input name="consignor" autocomplete="off"></label>
+      <div class="row">
+        <label>Цена закупа, ₽<input name="buyPrice" type="number" inputmode="numeric" min="0" step="1"></label>
+        <label>Дата закупа<input name="buyDate" type="date"></label>
+      </div>
+      <div class="row">
+        <label>У кого куплено<input name="seller" autocomplete="off"></label>
+        <label>Документ закупа<input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
+      </div>
+      <label>Цена продажи план, ₽<input name="planPrice" type="number" inputmode="numeric" min="0" step="1"></label>
+      <p id="markup-hint" class="hint"></p>
+      <fieldset id="sale-fields" hidden>
+        <label>Статус<select name="status" data-list="status"></select></label>
+        <div class="row" id="sale-row">
+          <label>Цена продажи, ₽<input name="salePrice" type="number" inputmode="numeric" min="0" step="1"></label>
+          <label>Дата продажи<input name="saleDate" type="date"></label>
+        </div>
+      </fieldset>
+      <label>Заметки<textarea name="notes" rows="3" maxlength="1000"></textarea></label>
+      <p id="form-error" class="error" role="alert"></p>
+      <button class="primary wide" type="submit" id="form-submit">Сохранить</button>
+      <button class="danger-link" type="button" id="btn-delete" hidden>Удалить вещь</button>
+    </form>
+    <datalist id="dl-category"></datalist>
+    <datalist id="dl-brand"></datalist>
+  </section>
+
+  <!-- Статистика -->
+  <section id="view-stats" class="view" hidden>
+    <button class="back" type="button" data-back>‹ Назад</button>
+    <h2>Статистика</h2>
+    <div id="stats-tiles" class="tiles"></div>
+    <h3 class="section-title">Прибыль по месяцам</h3>
+    <div id="stats-chart" class="chart"></div>
+    <div id="stats-months" class="table-wrap"></div>
+    <h3 class="section-title">По категориям (продано)</h3>
+    <div id="stats-cats" class="table-wrap"></div>
+    <h3 class="section-title">Долго лежат</h3>
+    <ul id="stats-stale" class="items"></ul>
+  </section>
+
+  <!-- Продажа -->
+  <div id="sell-sheet" class="sheet" hidden>
+    <form id="sell-form" class="sheet-body" novalidate role="dialog" aria-labelledby="sell-h">
+      <h3 id="sell-h">Отметить «Продано»</h3>
+      <p id="sell-title" class="muted"></p>
+      <label>Цена продажи, ₽ *<input name="salePrice" type="number" inputmode="numeric" min="0" step="1" required></label>
+      <label>Дата продажи<input name="saleDate" type="date"></label>
+      <p id="sell-profit" class="hint"></p>
+      <p id="sell-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button type="button" id="sell-cancel">Отмена</button>
+        <button type="submit" class="primary">Продано</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Фото на весь экран -->
+  <div id="lightbox" class="lightbox" hidden></div>
+
+  <div id="toast" class="toast" hidden role="status"></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
