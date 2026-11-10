@@ -268,3 +268,18 @@ input[type="number"] { -moz-appearance: textfield; }
 .settle-amount { font-size: 26px; font-weight: 700; letter-spacing: -.01em; margin-top: 2px; }
 .settle-card .muted { margin: 6px 0 0; }
 .settle-note { margin-top: 10px; font-size: 13px; }
+
+/* ---- свайп влево → «Удалить» */
+.swipe-row { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); }
+.swipe-row:last-child { border-bottom: 0; }
+.swipe-row > .item {
+  position: relative; z-index: 1; background: var(--bg); border-bottom: 0;
+  touch-action: pan-y; /* вертикальная прокрутка — браузеру, горизонтальный жест — нам */
+  transition: transform .2s ease; user-select: none; -webkit-user-select: none;
+}
+.swipe-delete {
+  position: absolute; top: 0; right: 0; bottom: 0; width: 88px; z-index: 0;
+  border-radius: 0; background: var(--danger); color: #fff; font-weight: 600; font-size: 14px;
+}
+.swipe-delete:active { transform: none; opacity: .85; }
+#btn-delete-item { margin-top: 6px; }

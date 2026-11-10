@@ -18,6 +18,7 @@ const DEFAULT_LISTS = {
   source: ['Выкуп', 'Комиссия'],
   authenticity: ['Не проверено', 'Проверено', 'Есть сомнения'],
   status: [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold],
+  country: ['США', 'Европа', 'Китай', 'Корея', 'Япония'],
 };
 
 const state = {
@@ -107,10 +108,28 @@ const ruToIso = (s) => { const d = parseRuDate(s); return d ? isoOf(d) : ''; };
 const isoToRu = (s) => (s ? s.split('-').reverse().join('.') : '');
 const dayDiff = (a, b) => Math.round((b - a) / 86400000);
 
+const COMMISSION = 'Комиссия';
+const isCommission = (item) => item.source === COMMISSION;
+/** Наша комиссия с суммы (цены продажи или плановой). null — процент не указан. */
+function commissionFrom(item, price) {
+  if (!isNum(price) || !isNum(item.commissionPct)) return null;
+  return Math.round((price * item.commissionPct) / 100);
+}
+/** Прибыль проданной вещи: комиссионной — наша комиссия, выкупленной — продажа минус закупка. */
 function profitOf(item) {
-  if (!isNum(item.salePrice) || !isNum(item.buyPrice)) return null;
+  if (!isNum(item.salePrice)) return null;
+  if (isCommission(item)) return commissionFrom(item, item.salePrice);
+  if (!isNum(item.buyPrice)) return null;
   return item.salePrice - item.buyPrice;
 }
+/** Ожидаемый доход с плановой цены (наценка или комиссия). */
+function plannedGain(item) {
+  if (isCommission(item)) return commissionFrom(item, item.planPrice);
+  return isNum(item.planPrice) && isNum(item.buyPrice) ? item.planPrice - item.buyPrice : null;
+}
+
+const COUNTRY_FLAGS = { 'США': '🇺🇸', 'Европа': '🇪🇺', 'Китай': '🇨🇳', 'Корея': '🇰🇷', 'Япония': '🇯🇵' };
+const withFlag = (c) => (c ? `${COUNTRY_FLAGS[c] ? COUNTRY_FLAGS[c] + ' ' : ''}${c}` : '');
 /** Сколько дней вещь лежит (для непроданных) или продавалась (для проданных). */
 function daysHeld(item) {
   const from = parseRuDate(item.buyDate);
@@ -356,26 +375,120 @@ function filtered() {
     .sort(SORTS[state.sort] || SORTS.new);
 }
 
-function itemRow(item, onClick) {
+function itemRow(item, onClick, swipeable) {
   const thumb = el('div', { class: 'thumb' + (item.hasPhoto ? ' loading' : '') }, item.hasPhoto ? null : icon('shirt'));
   if (item.hasPhoto) lazyPhoto(item.id, thumb);
   const p = profitOf(item);
   const tags = [];
   if (item.status === STATUS.inTransit && state.tab !== STATUS.inTransit) tags.push(el('span', { class: 'badge info' }, 'В пути'));
   if (item.status === STATUS.reserved) tags.push(el('span', { class: 'badge warn' }, 'Бронь'));
-  if (item.source === 'Комиссия') tags.push(el('span', { class: 'badge info' }, 'Комиссия'));
+  if (isCommission(item)) {
+    tags.push(el('span', { class: 'badge info' }, isNum(item.commissionPct) ? `Комиссия ${item.commissionPct}%` : 'Комиссия'));
+  }
   if (isStale(item)) tags.push(el('span', { class: 'badge' }, `${daysHeld(item)} дн.`));
   if (item.authenticity === 'Есть сомнения') tags.push(el('span', { class: 'badge warn' }, 'Сомнения'));
-  const price = item.status === STATUS.sold
-    ? [rub(item.salePrice), p !== null ? el('small', { class: p >= 0 ? 'profit-plus' : 'profit-minus' }, signedRub(p)) : null]
-    : [rub(item.planPrice), isNum(item.buyPrice) ? el('small', { class: 'muted-small' }, 'закуп ' + nf.format(item.buyPrice)) : null];
-  return el('li', { class: 'item', onclick: onClick || (() => openItem(item.id)) },
+  let sub;
+  if (item.status === STATUS.sold) {
+    sub = p !== null ? el('small', { class: p >= 0 ? 'profit-plus' : 'profit-minus' }, signedRub(p)) : null;
+  } else if (isCommission(item)) {
+    const c = commissionFrom(item, item.planPrice);
+    sub = c !== null ? el('small', { class: 'muted-small' }, 'наши ' + nf.format(c)) : null;
+  } else {
+    sub = isNum(item.buyPrice) ? el('small', { class: 'muted-small' }, 'закуп ' + nf.format(item.buyPrice)) : null;
+  }
+  const flag = COUNTRY_FLAGS[item.country] ? COUNTRY_FLAGS[item.country] + ' ' : '';
+  const content = el('div', { class: 'item' },
     thumb,
     el('div', { class: 'item-main' },
       el('div', { class: 'item-title' }, item.title || 'Без названия'),
-      el('div', { class: 'item-sub' }, [item.brand, item.size, item.category].filter(Boolean).join(' · ') || '—'),
+      el('div', { class: 'item-sub' }, flag + ([item.brand, item.size, item.category].filter(Boolean).join(' · ') || '—')),
       tags.length ? el('div', { class: 'item-tags' }, tags) : null),
-    el('div', { class: 'item-price' }, price));
+    el('div', { class: 'item-price' }, rub(item.status === STATUS.sold ? item.salePrice : item.planPrice), sub));
+  const row = el('li', { class: 'swipe-row' }, content);
+  content.addEventListener('click', () => {
+    if (row.dataset.swiped) return;              // это был свайп, а не нажатие
+    if (row.classList.contains('open')) { closeSwipe(row); return; }
+    (onClick || (() => openItem(item.id)))();
+  });
+  if (swipeable) {
+    const del = el('button', { type: 'button', class: 'swipe-delete', 'aria-label': 'Удалить ' + item.title, onclick: () => deleteItem(item) }, 'Удалить');
+    row.prepend(del);
+    enableSwipe(row, content);
+  }
+  return row;
+}
+
+// ---------------------------------------------------------------- свайп влево → «Удалить»
+
+const SWIPE_OPEN = 88; // ширина красной кнопки
+let openSwipeRow = null;
+
+function closeSwipe(row) {
+  if (!row) return;
+  row.classList.remove('open');
+  row.querySelector('.item').style.transform = '';
+  if (openSwipeRow === row) openSwipeRow = null;
+}
+
+function enableSwipe(row, content) {
+  let startX = 0, startY = 0, dx = 0, base = 0, tracking = false, decided = false, horizontal = false;
+  content.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    startX = e.clientX; startY = e.clientY; dx = 0;
+    base = row.classList.contains('open') ? -SWIPE_OPEN : 0;
+    tracking = true; decided = false; horizontal = false;
+  });
+  content.addEventListener('pointermove', (e) => {
+    if (!tracking) return;
+    const mx = e.clientX - startX, my = e.clientY - startY;
+    if (!decided) {
+      if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
+      decided = true;
+      horizontal = Math.abs(mx) > Math.abs(my);
+      if (!horizontal) { tracking = false; return; } // вертикально — обычная прокрутка
+      try { content.setPointerCapture(e.pointerId); } catch (err) { /* синтетические события */ }
+      if (openSwipeRow && openSwipeRow !== row) closeSwipe(openSwipeRow);
+      row.dataset.swiped = '1';
+      content.style.transition = 'none';
+    }
+    dx = Math.min(0, Math.max(-SWIPE_OPEN * 1.5, base + mx));
+    content.style.transform = `translateX(${dx}px)`;
+  });
+  const finish = () => {
+    if (!tracking) return;
+    tracking = false;
+    if (!horizontal) return;
+    content.style.transition = '';
+    if (dx < -SWIPE_OPEN / 2) {
+      row.classList.add('open');
+      content.style.transform = `translateX(${-SWIPE_OPEN}px)`;
+      openSwipeRow = row;
+      haptic('tap');
+    } else closeSwipe(row);
+    setTimeout(() => { delete row.dataset.swiped; }, 0); // гасим «клик» после свайпа
+  };
+  content.addEventListener('pointerup', finish);
+  content.addEventListener('pointercancel', finish);
+}
+
+/** Удаление вещи (из свайпа, карточки или формы) с подтверждением. */
+async function deleteItem(item) {
+  if (!(await ask(`Удалить «${item.title}» из таблицы? Фото уйдёт в корзину Google Диска.`))) {
+    closeSwipe(openSwipeRow);
+    return false;
+  }
+  try {
+    await api('delete', { id: item.id, version: item.changedAt });
+    state.form.dirty = false;
+    haptic('success');
+    toast('Удалено');
+    if (state.view !== 'list') show('list');
+    await loadItems({ silent: true });
+    return true;
+  } catch (e) {
+    handleWriteError(e, state.view === 'form' ? $('#form-error') : null);
+    return false;
+  }
 }
 
 function renderList() {
@@ -404,7 +517,8 @@ function renderList() {
     const plan = list.reduce((s, i) => s + (i.planPrice || 0), 0);
     note.textContent = list.length > 1 ? `${pieces(list.length)}, план продаж ${rub(plan)}` : '';
   }
-  box.replaceChildren(...list.map((item) => itemRow(item)));
+  openSwipeRow = null;
+  box.replaceChildren(...list.map((item) => itemRow(item, null, true)));
 }
 
 function resetFilters() {
@@ -493,7 +607,8 @@ function openLightbox() {
 
 const ITEM_FIELDS = [
   ['category', 'Категория'], ['brand', 'Бренд'], ['size', 'Размер'], ['condition', 'Состояние'],
-  ['authenticity', 'Подлинность'], ['source', 'Источник'], ['consignor', 'Комитент'],
+  ['country', 'Страна', withFlag], ['authenticity', 'Подлинность'], ['source', 'Источник'], ['consignor', 'Комитент'],
+  ['commissionPct', 'Комиссия', (v) => `${v}%`],
   ['buyPrice', 'Закуп', rub], ['buyDate', 'Дата закупа'], ['buyer', 'Кто платил'], ['seller', 'У кого куплено'],
   ['buyDoc', 'Документ'], ['planPrice', 'План продажи', rub], ['salePrice', 'Продано за', rub], ['saleDate', 'Дата продажи'],
   ['soldBy', 'Деньги получил'], ['notes', 'Заметки'], ['addedBy', 'Добавил'], ['changedBy', 'Изменил'],
@@ -538,8 +653,9 @@ function openItem(id, opts) {
   if (item.status === STATUS.sold) {
     big.replaceChildren(rub(item.salePrice), p !== null ? el('small', { class: p >= 0 ? 'profit-plus' : 'profit-minus' }, signedRub(p)) : null);
   } else {
-    const margin = isNum(item.planPrice) && isNum(item.buyPrice) ? item.planPrice - item.buyPrice : null;
-    big.replaceChildren(rub(item.planPrice), margin !== null ? el('small', { class: 'muted-inline' }, `наценка ${signedRub(margin)}`) : null);
+    const gain = plannedGain(item);
+    const label = isCommission(item) ? 'наша комиссия' : 'наценка';
+    big.replaceChildren(rub(item.planPrice), gain !== null ? el('small', { class: 'muted-inline' }, `${label} ${signedRub(gain)}`) : null);
   }
 
   const rows = [];
@@ -548,6 +664,14 @@ function openItem(id, opts) {
     if (v === '' || v === null || v === undefined) return;
     rows.push(el('dt', {}, label), el('dd', {}, fmt ? fmt(v) : v));
   });
+  if (isCommission(item)) {
+    // Сколько отдать комитенту: от цены продажи, а пока не продано — от плановой.
+    const base = item.status === STATUS.sold ? item.salePrice : item.planPrice;
+    const ours = commissionFrom(item, base);
+    if (ours !== null) {
+      rows.push(el('dt', {}, item.status === STATUS.sold ? 'Комитенту' : 'Комитенту (план)'), el('dd', {}, rub(base - ours)));
+    }
+  }
   const held = daysHeld(item);
   if (held !== null) {
     rows.splice(rows.length - 2, 0, el('dt', {}, item.status === STATUS.sold ? 'Продавалась' : 'Лежит'),
@@ -627,9 +751,18 @@ function openSell() {
 
 function updateSellProfit() {
   const raw = $('#sell-form').salePrice.value;
-  const buy = state.current && state.current.buyPrice;
+  const item = state.current;
+  const buy = item && item.buyPrice;
   const hint = $('#sell-profit');
   hint.className = 'hint';
+  if (item && isCommission(item)) {
+    if (!isNum(item.commissionPct)) { hint.textContent = 'Процент комиссии не указан — прибыль не посчитается.'; return; }
+    if (raw === '') { hint.textContent = ''; return; }
+    const ours = commissionFrom(item, Number(raw));
+    hint.textContent = `Наша комиссия ${item.commissionPct}%: ${signedRub(ours)}, комитенту ${rub(Number(raw) - ours)}`;
+    hint.classList.add('profit-plus');
+    return;
+  }
   if (raw === '' || !isNum(buy)) { hint.textContent = isNum(buy) ? '' : 'Закуп не указан — прибыль не посчитается.'; return; }
   const p = Number(raw) - buy;
   hint.textContent = `Прибыль: ${signedRub(p)} (закуп ${rub(buy)})`;
@@ -661,10 +794,12 @@ async function submitSell(e) {
 
 // ---------------------------------------------------------------- форма (добавить / изменить)
 
-const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'condition', 'source', 'authenticity', 'consignor',
-  'buyPrice', 'buyDate', 'buyer', 'seller', 'buyDoc', 'planPrice', 'notes'];
-const CLONE_FIELDS = ['title', 'category', 'brand', 'condition', 'source', 'authenticity', 'consignor',
-  'buyPrice', 'buyer', 'seller', 'buyDoc', 'planPrice'];
+const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'condition', 'country', 'source', 'authenticity', 'consignor',
+  'commissionPct', 'buyPrice', 'buyDate', 'buyer', 'seller', 'buyDoc', 'planPrice', 'notes'];
+const CLONE_FIELDS = ['title', 'category', 'brand', 'condition', 'country', 'source', 'authenticity', 'consignor',
+  'commissionPct', 'buyPrice', 'buyer', 'seller', 'buyDoc', 'planPrice'];
+// Поля закупки — у комиссионных вещей их нет.
+const BUY_ONLY_FIELDS = ['buyPrice', 'buyer', 'seller'];
 
 const myName = () => (state.user && state.user.name) || '';
 /** Партнёры для выпадающих списков: я первым, затем остальные. */
@@ -769,12 +904,23 @@ function openForm(mode, source) {
 
 function syncFormExtras() {
   const f = $('#item-form');
-  $('#consignor-field').hidden = f.source.value !== 'Комиссия' && !f.consignor.value;
+  const commission = f.source.value === COMMISSION;
+  // Комиссия: вместо закупки — комитент и процент; «Дата закупа» → «Дата приёма».
+  $('#consignor-row').hidden = !commission;
+  document.querySelectorAll('#item-form .buy-only').forEach((n) => { n.hidden = commission; });
+  $('#buydate-label').textContent = commission ? 'Дата приёма' : 'Дата закупа';
+  $('#buydoc-label').textContent = commission ? 'Договор комиссии' : 'Документ закупа';
   $('#sale-row').hidden = f.status.value !== STATUS.sold;
   const buy = f.buyPrice.value === '' ? null : Number(f.buyPrice.value);
   const plan = f.planPrice.value === '' ? null : Number(f.planPrice.value);
+  const pct = f.commissionPct.value === '' ? null : Number(String(f.commissionPct.value).replace(',', '.'));
   const hint = $('#markup-hint');
-  if (isNum(buy) && isNum(plan) && buy > 0) {
+  if (commission) {
+    if (isNum(plan) && isNum(pct)) {
+      const ours = Math.round((plan * pct) / 100);
+      hint.textContent = `Наша комиссия ${signedRub(ours)}, комитенту ${rub(plan - ours)}`;
+    } else hint.textContent = 'Укажите цену и процент — посчитаю нашу комиссию и выплату комитенту.';
+  } else if (isNum(buy) && isNum(plan) && buy > 0) {
     const m = plan - buy;
     hint.textContent = `Наценка ${signedRub(m)} (${Math.round((m / buy) * 100)}%)`;
   } else hint.textContent = '';
@@ -845,6 +991,10 @@ function collectForm() {
   const f = $('#item-form');
   const data = {};
   FORM_FIELDS.forEach((k) => { data[k] = f.elements[k].value.trim(); });
+  data.commissionPct = data.commissionPct.replace(',', '.');
+  // Комиссия: закупки нет — чистим её поля. Выкуп: процент комиссии не нужен.
+  if (data.source === COMMISSION) BUY_ONLY_FIELDS.forEach((k) => { data[k] = ''; });
+  else { data.commissionPct = ''; data.consignor = ''; }
   data.status = f.status.value;
   if (state.form.mode === 'edit') {
     const sold = data.status === STATUS.sold;
@@ -865,6 +1015,9 @@ async function submitForm(e) {
   if (data.status === STATUS.sold && data.salePrice === '') { err.textContent = 'Укажите цену продажи.'; f.salePrice.focus(); return; }
   for (const k of ['buyPrice', 'planPrice', 'salePrice']) {
     if (data[k] !== undefined && data[k] !== '' && !(Number(data[k]) >= 0)) { err.textContent = 'Проверьте цены.'; f.elements[k].focus(); return; }
+  }
+  if (data.commissionPct !== '' && !(Number(data.commissionPct) >= 0 && Number(data.commissionPct) <= 100)) {
+    err.textContent = 'Комиссия — число от 0 до 100 %.'; f.commissionPct.focus(); return;
   }
 
   const btn = $('#form-submit');
@@ -904,17 +1057,8 @@ async function submitForm(e) {
   }
 }
 
-async function deleteCurrent() {
-  const item = state.current;
-  if (!(await ask(`Удалить «${item.title}» из таблицы? Фото уйдёт в корзину Google Диска.`))) return;
-  try {
-    await api('delete', { id: item.id, version: item.changedAt });
-    state.form.dirty = false;
-    haptic('success');
-    toast('Удалено');
-    show('list');
-    await loadItems({ silent: true });
-  } catch (e) { handleWriteError(e, $('#form-error')); }
+function deleteCurrent() {
+  return deleteItem(state.current);
 }
 
 // ---------------------------------------------------------------- статистика
@@ -984,7 +1128,7 @@ function partnerTotals(period) {
 }
 
 /**
- * Взаиморасчёт поровну за всё время (без комиссионных вещей — их выручка не наша).
+ * Взаиморасчёт поровну за всё время. Комиссионные вещи — только наша комиссия (долю комитента отдаёт тот, кто получил деньги).
  * Каждый: получил от продаж − заплатил за закупки = «на руках». Поровну — это общий итог / число партнёров.
  * Кто держит больше своей доли — переводит разницу тем, у кого меньше.
  */
@@ -993,7 +1137,12 @@ function settlement() {
   let skipped = 0;
   const add = (name, v) => net.set(name, (net.get(name) || 0) + v);
   state.items.forEach((i) => {
-    if (i.source === 'Комиссия') return;
+    if (isCommission(i)) {
+      // Комиссионная: кто получил деньги, тот отдаёт долю комитенту — у него остаётся наша комиссия.
+      const ours = profitOf(i);
+      if (i.status === STATUS.sold && ours !== null) { if (i.soldBy) add(i.soldBy, ours); else skipped++; }
+      return;
+    }
     if (isNum(i.buyPrice) && i.buyPrice > 0) { if (i.buyer) add(i.buyer, -i.buyPrice); else skipped++; }
     if (i.status === STATUS.sold && isNum(i.salePrice)) { if (i.soldBy) add(i.soldBy, i.salePrice); else skipped++; }
   });
@@ -1077,7 +1226,7 @@ function renderGeneralStats() {
   const sold = state.items.filter((i) => i.status === STATUS.sold);
   const stockCost = onHand.reduce((s, i) => s + (i.buyPrice || 0), 0);
   const planSum = onHand.reduce((s, i) => s + (i.planPrice || 0), 0);
-  const potential = onHand.reduce((s, i) => s + (isNum(i.planPrice) && isNum(i.buyPrice) ? i.planPrice - i.buyPrice : 0), 0);
+  const potential = onHand.reduce((s, i) => s + (plannedGain(i) || 0), 0);
   const thisM = monthSales(0);
   const prevM = monthSales(1);
   const profitThis = thisM.reduce((s, i) => s + (profitOf(i) || 0), 0);
@@ -1124,30 +1273,36 @@ function renderGeneralStats() {
       el('td', {}, m.full), el('td', {}, m.count), el('td', {}, rub(m.revenue)),
       el('td', { class: m.profit < 0 ? 'profit-minus' : '' }, signedRub(m.profit)))))));
 
-  // По категориям
-  const byCat = new Map();
-  sold.forEach((i) => {
-    const k = i.category || 'Без категории';
-    const c = byCat.get(k) || { count: 0, profit: 0, days: [] };
-    c.count++;
-    c.profit += profitOf(i) || 0;
-    const d = daysHeld(i);
-    if (d !== null) c.days.push(d);
-    byCat.set(k, c);
-  });
-  const cats = [...byCat.entries()].sort((a, b) => b[1].profit - a[1].profit);
-  $('#stats-cats').replaceChildren(cats.length ? el('table', {},
-    el('thead', {}, el('tr', {}, el('th', {}, 'Категория'), el('th', {}, 'Шт.'), el('th', {}, 'Прибыль'), el('th', {}, 'Срок'))),
-    el('tbody', {}, cats.map(([name, c]) => el('tr', {},
-      el('td', {}, name), el('td', {}, c.count),
-      el('td', { class: c.profit < 0 ? 'profit-minus' : '' }, signedRub(c.profit)),
-      el('td', {}, c.days.length ? `${median(c.days)} дн.` : '—')))))
-    : el('p', { class: 'muted' }, 'Пока нет продаж.'));
+  // По категориям и по странам — одна и та же таблица по проданным
+  $('#stats-cats').replaceChildren(groupTable(sold, 'Категория', (i) => i.category || 'Без категории'));
+  $('#stats-countries').replaceChildren(groupTable(sold, 'Страна', (i) => withFlag(i.country) || 'Не указана'));
 
   const stale = onHand.filter(isStale).sort((a, b) => (daysHeld(b) || 0) - (daysHeld(a) || 0));
   $('#stats-stale').replaceChildren(...(stale.length
     ? stale.map((i) => itemRow(i))
     : [el('li', { class: 'muted' }, `Нет вещей, которые лежат дольше ${STALE_DAYS} дней 👍`)]));
+}
+
+/** Таблица «группа — штук — прибыль — срок продажи» по проданным вещам. */
+function groupTable(sold, title, keyOf) {
+  const groups = new Map();
+  sold.forEach((i) => {
+    const k = keyOf(i);
+    const c = groups.get(k) || { count: 0, profit: 0, days: [] };
+    c.count++;
+    c.profit += profitOf(i) || 0;
+    const d = daysHeld(i);
+    if (d !== null) c.days.push(d);
+    groups.set(k, c);
+  });
+  const rows = [...groups.entries()].sort((a, b) => b[1].profit - a[1].profit);
+  if (!rows.length) return el('p', { class: 'muted' }, 'Пока нет продаж.');
+  return el('table', {},
+    el('thead', {}, el('tr', {}, el('th', {}, title), el('th', {}, 'Шт.'), el('th', {}, 'Прибыль'), el('th', {}, 'Срок'))),
+    el('tbody', {}, rows.map(([name, c]) => el('tr', {},
+      el('td', {}, name), el('td', {}, c.count),
+      el('td', { class: c.profit < 0 ? 'profit-minus' : '' }, signedRub(c.profit)),
+      el('td', {}, c.days.length ? `${median(c.days)} дн.` : '—')))));
 }
 
 /** Столбики прибыли по месяцам (одна серия, без легенды; значения — в таблице ниже и по нажатию). */
@@ -1220,13 +1375,13 @@ const demoDb = (() => {
     photos: new Map(), // id → { mime, base64 } — загруженные в демо фото
     items: [
       { ...base, id: 'd0000001', title: 'Пуховик The North Face Nuptse', category: 'Куртки', brand: 'The North Face', size: 'M', condition: 'Хорошее', source: 'Выкуп', buyPrice: 9000, buyDate: d(140), planPrice: 17000, status: 'Продано', salePrice: 16000, saleDate: d(110), authenticity: 'Проверено', buyer: 'Антон', soldBy: 'Антон' },
-      { ...base, id: 'd0000002', title: 'Кроссовки Nike Dunk Low', category: 'Обувь', brand: 'Nike', size: '42', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 9000, buyDate: d(75), planPrice: 15000, status: 'Продано', salePrice: 14500, saleDate: d(40), authenticity: 'Проверено', buyer: 'Дима', soldBy: 'Антон' },
+      { ...base, id: 'd0000002', title: 'Кроссовки Nike Dunk Low', category: 'Обувь', brand: 'Nike', country: 'Китай', size: '42', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 9000, buyDate: d(75), planPrice: 15000, status: 'Продано', salePrice: 14500, saleDate: d(40), authenticity: 'Проверено', buyer: 'Дима', soldBy: 'Антон' },
       { ...base, id: 'd0000003', title: 'Ремень Gucci GG', category: 'Аксессуары', brand: 'Gucci', size: '90', condition: 'Отличное', source: 'Выкуп', buyPrice: 22000, buyDate: d(95), planPrice: 34000, status: 'В наличии', authenticity: 'Есть сомнения', hasPhoto: false },
-      { ...base, id: 'd0000004', title: 'Худи Supreme Box Logo', category: 'Худи', brand: 'Supreme', size: 'M', condition: 'Хорошее', source: 'Комиссия', consignor: 'Иван', buyPrice: null, buyDate: d(20), planPrice: 25000, status: 'Бронь', authenticity: 'Не проверено' },
+      { ...base, id: 'd0000004', title: 'Худи Supreme Box Logo', category: 'Худи', brand: 'Supreme', size: 'M', condition: 'Хорошее', source: 'Комиссия', consignor: 'Иван', commissionPct: 20, country: 'США', buyPrice: null, buyDate: d(20), planPrice: 25000, status: 'Бронь', authenticity: 'Не проверено' },
       { ...base, id: 'd0000005', title: 'Сумка Prada Re-Edition', category: 'Сумки', brand: 'Prada', size: '', condition: 'Отличное', source: 'Выкуп', buyPrice: 48000, buyDate: d(18), planPrice: 70000, status: 'Продано', salePrice: 52000, saleDate: d(3), authenticity: 'Проверено', buyer: 'Антон', soldBy: 'Дима' },
-      { ...base, id: 'd0000006', title: 'Куртка Stone Island Soft Shell', category: 'Куртки', brand: 'Stone Island', size: 'L', condition: 'Отличное', source: 'Выкуп', buyPrice: 18000, buyDate: d(9), planPrice: 32000, status: 'В наличии', seller: 'Avito', authenticity: 'Проверено', buyer: 'Дима' },
+      { ...base, id: 'd0000006', title: 'Куртка Stone Island Soft Shell', category: 'Куртки', brand: 'Stone Island', country: 'Европа', size: 'L', condition: 'Отличное', source: 'Выкуп', buyPrice: 18000, buyDate: d(9), planPrice: 32000, status: 'В наличии', seller: 'Avito', authenticity: 'Проверено', buyer: 'Дима' },
       { ...base, id: 'd0000007', title: 'Футболка Comme des Garçons Play', category: 'Футболки', brand: 'CDG', size: 'S', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 4000, buyDate: d(2), planPrice: 8500, status: 'В наличии', authenticity: 'Проверено', buyer: 'Антон' },
-      { ...base, id: 'd0000008', title: 'Кроссовки New Balance 990v6', category: 'Обувь', brand: 'New Balance', size: '43', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 15000, buyDate: d(4), planPrice: 24000, status: 'В пути', seller: 'Poizon', authenticity: 'Не проверено', buyer: 'Дима' },
+      { ...base, id: 'd0000008', title: 'Кроссовки New Balance 990v6', category: 'Обувь', brand: 'New Balance', country: 'Китай', size: '43', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 15000, buyDate: d(4), planPrice: 24000, status: 'В пути', seller: 'Poizon', authenticity: 'Не проверено', buyer: 'Дима' },
       { ...base, id: 'd0000009', title: 'Кепка Stussy', category: 'Аксессуары', brand: 'Stussy', size: 'OS', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 2500, buyDate: d(1), planPrice: 5000, status: 'В пути', authenticity: 'Не проверено', buyer: 'Антон', hasPhoto: false },
     ],
   };
@@ -1271,8 +1426,9 @@ async function demoApi(action, p) {
     }
     case 'add': {
       const id = Math.random().toString(16).slice(2, 10);
-      const it = { ...p, id, buyPrice: num(p.buyPrice), planPrice: num(p.planPrice), buyDate: isoToRu(p.buyDate),
-        status: p.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock, buyer: p.buyer || 'Антон', hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
+      const it = { ...p, id, buyPrice: num(p.buyPrice), planPrice: num(p.planPrice), commissionPct: num(p.commissionPct),
+        buyDate: isoToRu(p.buyDate), status: p.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock,
+        buyer: p.source === COMMISSION ? '' : (p.buyer || 'Антон'), hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
       if (p.photo) demoDb.photos.set(id, p.photo);
       delete it.photo;
       touch(it);
@@ -1286,7 +1442,7 @@ async function demoApi(action, p) {
       if (p.photo) { demoDb.photos.set(p.id, p.photo); it.hasPhoto = true; }
       if (p.removePhoto) { demoDb.photos.delete(p.id); it.hasPhoto = false; }
       // Как на сервере: меняем только присланные поля.
-      ['buyPrice', 'planPrice', 'salePrice'].forEach((k) => { if (k in patch) patch[k] = num(patch[k]); });
+      ['buyPrice', 'planPrice', 'salePrice', 'commissionPct'].forEach((k) => { if (k in patch) patch[k] = num(patch[k]); });
       ['buyDate', 'saleDate'].forEach((k) => { if (k in patch) patch[k] = isoToRu(patch[k]); });
       Object.assign(it, patch);
       if (it.status !== STATUS.sold) { it.salePrice = null; it.saleDate = ''; it.soldBy = ''; }
@@ -1350,6 +1506,9 @@ function bindEvents() {
   $('#photo-input').addEventListener('change', onPhotoPicked);
   $('#photo-remove').addEventListener('click', onPhotoRemove);
   $('#btn-delete').addEventListener('click', deleteCurrent);
+  $('#btn-delete-item').addEventListener('click', deleteCurrent);
+  // Нажатие мимо открытой строки закрывает свайп
+  document.addEventListener('pointerdown', (e) => { if (openSwipeRow && !openSwipeRow.contains(e.target)) closeSwipe(openSwipeRow); });
 
   $('#sell-form').addEventListener('submit', submitSell);
   $('#sell-form').salePrice.addEventListener('input', updateSellProfit);
@@ -1384,6 +1543,8 @@ async function init() {
     tg.ready();
     tg.expand();
     tg.BackButton.onClick(goBack);
+    // Чтобы свайпы и прокрутка не сворачивали приложение (Telegram 7.7+)
+    try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) { /* старый Telegram */ }
   }
   bindEvents();
   const savedSort = storage.get('uv.sort');

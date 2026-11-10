@@ -6,7 +6,8 @@
   <meta name="color-scheme" content="light dark">
   <title>Учёт вещей</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="style.css">
+  <!-- ?v= — номер версии: меняйте при каждом обновлении, иначе Telegram покажет старые файлы из кеша -->
+  <link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
   <!-- Список -->
@@ -58,6 +59,7 @@
       <button id="btn-clone" type="button">Похожая вещь</button>
     </div>
     <dl id="item-fields" class="fields"></dl>
+    <button id="btn-delete-item" class="danger-link" type="button">Удалить вещь</button>
   </section>
 
   <!-- Добавление / правка -->
@@ -78,21 +80,28 @@
         <label>Бренд<input name="brand" list="dl-brand" autocomplete="off"></label>
         <label>Размер<input name="size" autocomplete="off"></label>
       </div>
-      <label>Состояние<select name="condition" data-list="condition"></select></label>
+      <div class="row">
+        <label>Состояние<select name="condition" data-list="condition"></select></label>
+        <label>Страна<select name="country" data-list="country"></select></label>
+      </div>
       <div class="row">
         <label>Источник<select name="source" data-list="source"></select></label>
         <label>Подлинность<select name="authenticity" data-list="authenticity"></select></label>
       </div>
-      <label id="consignor-field" hidden>Комитент<input name="consignor" autocomplete="off"></label>
-      <div class="row">
-        <label>Цена закупа, ₽<input name="buyPrice" type="number" inputmode="numeric" min="0" step="1"></label>
-        <label>Дата закупа<input name="buyDate" type="date"></label>
+      <!-- Выкуп: закупка. Комиссия: комитент и процент — поля переключаются по «Источнику» -->
+      <div class="row" id="consignor-row" hidden>
+        <label>Комитент<input name="consignor" autocomplete="off" placeholder="чья вещь"></label>
+        <label>Комиссия, %<input name="commissionPct" type="number" inputmode="decimal" min="0" max="100" step="0.5" placeholder="напр. 20"></label>
       </div>
       <div class="row">
+        <label class="buy-only">Цена закупа, ₽<input name="buyPrice" type="number" inputmode="numeric" min="0" step="1"></label>
+        <label><span id="buydate-label">Дата закупа</span><input name="buyDate" type="date"></label>
+      </div>
+      <div class="row buy-only">
         <label>Кто платил<select name="buyer" data-list="partners"></select></label>
         <label>У кого куплено<input name="seller" autocomplete="off"></label>
       </div>
-      <label>Документ закупа<input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
+      <label><span id="buydoc-label">Документ закупа</span><input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
       <label>Цена продажи план, ₽<input name="planPrice" type="number" inputmode="numeric" min="0" step="1"></label>
       <p id="markup-hint" class="hint"></p>
       <fieldset id="sale-fields">
@@ -129,6 +138,8 @@
       <div id="stats-months" class="table-wrap"></div>
       <h3 class="section-title">По категориям (продано)</h3>
       <div id="stats-cats" class="table-wrap"></div>
+      <h3 class="section-title">По странам (продано)</h3>
+      <div id="stats-countries" class="table-wrap"></div>
       <h3 class="section-title">Долго лежат</h3>
       <ul id="stats-stale" class="items"></ul>
     </div>
@@ -139,7 +150,7 @@
       <h3 class="section-title">Взаиморасчёт поровну</h3>
       <div id="partner-settle"></div>
       <p class="muted settle-note">Считается за всё время: всё, что каждый заплатил за закупки и получил от продаж, делится пополам.
-        Деньги в непроданных вещах тоже учитываются как вложение.</p>
+        Деньги в непроданных вещах тоже учитываются как вложение. По комиссионным вещам учитывается только наша комиссия: долю комитента отдаёт тот, кто получил деньги.</p>
     </div>
   </section>
 
@@ -167,7 +178,7 @@
 
   <div id="toast" class="toast" hidden role="status"></div>
 
-  <script src="config.js"></script>
-  <script src="app.js"></script>
+  <script src="config.js?v=3"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>
