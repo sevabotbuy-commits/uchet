@@ -365,9 +365,10 @@ async function loadItems({ silent = false, force = false } = {}) {
     state.items = pendingDeletes.size ? fresh.filter((i) => !pendingDeletes.has(i.id)) : fresh;
     state.lastLoad = Date.now();
     saveCache();
-    // Миниатюры могли поменяться — забываем те, у которых больше нет фото.
-    state.items.forEach((i) => { if (!i.hasPhoto) { state.photos.delete(i.id); state.fullPhotos.delete(i.id); } });
+    // Миниатюры могли поменяться: подставляем сохранённые, устаревшие забываем, недостающие докачиваем.
+    syncThumbs();
     refreshCurrentView();
+    prefetchThumbs();
   } finally {
     setLoading(false);
   }
@@ -1058,7 +1059,120 @@ function resetFilters() {
 
 // ---------------------------------------------------------------- фото
 
-// Миниатюры грузим по одному запросу на вещь, не больше 3 одновременно.
+// ---- миниатюры хранятся на телефоне: при следующем открытии показываются сразу, без сервера
+// Запись: id вещи → { k: «версия» фото (имя файла), src: картинка }. Сменилось фото — сменилась версия.
+const thumbStore = (() => {
+  const DB = DEMO ? 'uv-demo-thumbs' : 'uv-thumbs';
+  let dbp = null;
+  const open = () => {
+    if (!dbp) {
+      dbp = new Promise((resolve) => {
+        try {
+          const req = indexedDB.open(DB, 1);
+          req.onupgradeneeded = () => req.result.createObjectStore('t');
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => resolve(null);
+          req.onblocked = () => resolve(null);
+        } catch (e) { resolve(null); }
+      });
+    }
+    return dbp;
+  };
+  const tx = async (mode, fn) => {
+    const db = await open();
+    if (!db) return null;
+    return new Promise((resolve) => {
+      try {
+        const t = db.transaction('t', mode);
+        const r = fn(t.objectStore('t'));
+        t.oncomplete = () => resolve(r && 'result' in r ? r.result : null);
+        t.onerror = t.onabort = () => resolve(null);
+      } catch (e) { resolve(null); }
+    });
+  };
+  return {
+    /** Все сохранённые миниатюры: Map id → { k, src }. */
+    async all() {
+      const out = new Map();
+      const db = await open();
+      if (!db) return out;
+      return new Promise((resolve) => {
+        try {
+          const req = db.transaction('t').objectStore('t').openCursor();
+          req.onsuccess = () => {
+            const c = req.result;
+            if (!c) { resolve(out); return; }
+            out.set(c.key, c.value);
+            c.continue();
+          };
+          req.onerror = () => resolve(out);
+        } catch (e) { resolve(out); }
+      });
+    },
+    put(id, k, src) { return tx('readwrite', (st) => st.put({ k, src }, id)); },
+    del(id) { return tx('readwrite', (st) => st.delete(id)); },
+  };
+})();
+const photoKeys = new Map(); // id → версия миниатюры, которая сейчас в state.photos
+const savedThumbs = { map: null, ready: null };
+function loadSavedThumbs() {
+  if (!savedThumbs.ready) {
+    // не ждём дольше 400 мс: если хранилище тормозит — грузим с сервера как раньше
+    savedThumbs.ready = Promise.race([
+      thumbStore.all().then((m) => {
+        savedThumbs.map = m;
+        // Хранилище ответило позже, чем ждали, — всё равно подставляем сохранённые фото
+        if (state.items.length) {
+          const before = new Set(state.photos.keys());
+          syncThumbs();
+          state.photos.forEach((src, id) => { if (!before.has(id)) paintPhoto(id, src); });
+        }
+      }),
+      new Promise((r) => setTimeout(r, 400)),
+    ]);
+  }
+  return savedThumbs.ready;
+}
+const keyOf = (id) => { const it = state.items.find((i) => i.id === id); return it ? (it.photoKey || '') : ''; };
+
+/** Свериться с хранилищем: подставить сохранённые миниатюры, выбросить устаревшие. */
+function syncThumbs() {
+  const saved = savedThumbs.map;
+  state.items.forEach((i) => {
+    const k = i.photoKey || '';
+    if (!i.hasPhoto) {
+      state.photos.delete(i.id); state.fullPhotos.delete(i.id); photoKeys.delete(i.id);
+      if (saved && saved.has(i.id)) { saved.delete(i.id); thumbStore.del(i.id); }
+      return;
+    }
+    // Только что сняли фото в форме — оно и есть новая версия: запоминаем его на телефоне
+    if (photoKeys.get(i.id) === 'local' && state.photos.get(i.id)) {
+      photoKeys.set(i.id, k); thumbStore.put(i.id, k, state.photos.get(i.id));
+      if (saved) saved.set(i.id, { k, src: state.photos.get(i.id) });
+    }
+    // В памяти фото другой версии — забыть (и большое тоже)
+    if (photoKeys.has(i.id) && photoKeys.get(i.id) !== k) {
+      state.photos.delete(i.id); state.fullPhotos.delete(i.id); photoKeys.delete(i.id);
+    }
+    if (!state.photos.has(i.id) && saved && saved.has(i.id)) {
+      const v = saved.get(i.id);
+      if (v && v.k === k && v.src) { state.photos.set(i.id, v.src); photoKeys.set(i.id, k); }
+    }
+  });
+}
+
+/** Докачать в фоне миниатюры всех вещей, которых ещё нет — чтобы другие вкладки открывались уже с фото. */
+function prefetchThumbs() {
+  clearTimeout(prefetchThumbs.t);
+  prefetchThumbs.t = setTimeout(() => {
+    state.items.forEach((i) => {
+      if (i.hasPhoto && !state.photos.has(i.id) && !photoQueue.some((q) => q.id === i.id)) photoQueue.push({ id: i.id });
+    });
+    pumpPhotos();
+  }, 1200); // сначала — то, что на экране
+}
+
+// Миниатюры грузим пачками, не больше нескольких запросов одновременно.
 const photoQueue = [];
 let photoActive = 0;
 // Миниатюры строк списка запрашиваем, только когда строка подъезжает к экрану.
@@ -1098,7 +1212,7 @@ function paintPhoto(id, src) {
 }
 // Миниатюры — пачками по 8 одним запросом (сервер отвечает ~1 с на запрос, а не на фото), 2 запроса параллельно.
 const PHOTO_BATCH = 8;
-const PHOTO_PARALLEL = 2;
+const PHOTO_PARALLEL = 3;
 function pumpPhotos() {
   while (photoActive < PHOTO_PARALLEL && photoQueue.length) {
     const batch = [];
@@ -1116,6 +1230,12 @@ function pumpPhotos() {
           const ph = res && res[id];
           const src = ph ? `data:${ph.mime};base64,${ph.base64}` : null;
           state.photos.set(id, src);
+          if (src) {
+            const k = keyOf(id);
+            photoKeys.set(id, k);
+            thumbStore.put(id, k, src);
+            if (savedThumbs.map) savedThumbs.map.set(id, { k, src });
+          }
           paintPhoto(id, src);
         });
         photoActive--;
@@ -1856,7 +1976,7 @@ async function submitForm(e) {
     if (state.form.mode === 'edit') {
       const item = state.current;
       await api('update', Object.assign(data, { id: item.id, version: item.changedAt, photo, removePhoto: state.form.removePhoto }));
-      if (photo) { state.photos.set(item.id, state.form.photo.dataUrl); state.fullPhotos.set(item.id, state.form.photo.dataUrl); }
+      if (photo) { state.photos.set(item.id, state.form.photo.dataUrl); state.fullPhotos.set(item.id, state.form.photo.dataUrl); photoKeys.set(item.id, 'local'); }
       if (state.form.removePhoto) { state.photos.delete(item.id); state.fullPhotos.delete(item.id); }
       state.form.dirty = false;
       haptic('success');
@@ -1866,7 +1986,7 @@ async function submitForm(e) {
       state.stack = ['list'];
     } else {
       const res = await api('add', Object.assign(data, { photo }));
-      if (photo) { state.photos.set(res.id, state.form.photo.dataUrl); state.fullPhotos.set(res.id, state.form.photo.dataUrl); }
+      if (photo) { state.photos.set(res.id, state.form.photo.dataUrl); state.fullPhotos.set(res.id, state.form.photo.dataUrl); photoKeys.set(res.id, 'local'); }
       state.form.dirty = false;
       storage.del(DRAFT_KEY);
       haptic('success');
@@ -2382,7 +2502,7 @@ async function demoApi(action, p) {
       const it = { ...p, id, buyPrice: num(p.buyPrice), planPrice: num(p.planPrice), commissionPct: num(p.commissionPct),
         buyDate: isoToRu(p.buyDate), status: p.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock,
         buyer: p.source === COMMISSION ? '' : (p.buyer || 'Антон'), hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
-      if (p.photo) demoDb.photos.set(id, p.photo);
+      if (p.photo) { demoDb.photos.set(id, p.photo); it.photoKey = 'demo-' + Date.now(); }
       delete it.photo;
       touch(it);
       demoDb.items.push(it);
@@ -2392,7 +2512,7 @@ async function demoApi(action, p) {
       const it = find(p.id);
       const patch = { ...p };
       ['id', 'version', 'photo', 'removePhoto'].forEach((k) => delete patch[k]);
-      if (p.photo) { demoDb.photos.set(p.id, p.photo); it.hasPhoto = true; }
+      if (p.photo) { demoDb.photos.set(p.id, p.photo); it.hasPhoto = true; it.photoKey = 'demo-' + Date.now(); }
       if (p.removePhoto) { demoDb.photos.delete(p.id); it.hasPhoto = false; }
       // Как на сервере: меняем только присланные поля.
       ['buyPrice', 'planPrice', 'salePrice', 'commissionPct'].forEach((k) => { if (k in patch) patch[k] = num(patch[k]); });
@@ -2558,8 +2678,10 @@ async function init() {
 
   // Мгновенный показ из кеша, потом свежие данные.
   const cached = storage.get(CACHE_KEY);
+  await loadSavedThumbs();
   if (cached && Array.isArray(cached.items)) {
     state.items = cached.items;
+    syncThumbs();
     if (cached.lists) state.lists = { ...DEFAULT_LISTS, ...cached.lists };
     if (cached.user) state.user = cached.user;
     if (cached.partners) state.partners = cached.partners;
