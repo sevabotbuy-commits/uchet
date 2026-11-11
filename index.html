@@ -7,51 +7,91 @@
   <title>Учёт вещей</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <!-- ?v= — номер версии: меняйте при каждом обновлении, иначе Telegram покажет старые файлы из кеша -->
-  <link rel="stylesheet" href="style.css?v=3">
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
+  <div id="offline" class="offline" role="status" hidden>Нет сети — показаны сохранённые данные</div>
+
+  <!-- Индикатор «потяните вниз, чтобы обновить» -->
+  <div id="ptr" class="ptr" aria-hidden="true">
+    <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>
+  </div>
+
   <!-- Список -->
   <section id="view-list" class="view">
     <header class="top">
       <div class="top-row">
-        <h1>Учёт вещей</h1>
+        <div><small class="eyebrow">Склад</small><h1>Учёт вещей</h1></div>
         <div class="top-actions">
-          <button id="btn-stats" class="icon-btn" type="button" aria-label="Статистика" title="Статистика">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7" /></svg>
-          </button>
           <button id="btn-refresh" class="icon-btn" type="button" aria-label="Обновить" title="Обновить">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>
           </button>
         </div>
       </div>
-      <button id="summary" class="summary" type="button"></button>
+      <div id="summary" class="kpis"></div>
+      <button id="buyer-hint" class="buyer-hint" type="button" hidden></button>
     </header>
+    <!-- Поиск и вкладки прилипают к верху при прокрутке длинного списка -->
+    <div id="toolbar-sentinel" aria-hidden="true"></div>
+    <div id="toolbar" class="toolbar">
     <div class="search-row">
-      <input id="search" class="search" type="search" placeholder="Поиск" autocomplete="off" enterkeyhint="search">
+      <div class="search-wrap">
+        <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+        <input id="search" class="search" type="search" placeholder="Поиск" autocomplete="off" enterkeyhint="search">
+        <button id="search-clear" class="search-clear" type="button" aria-label="Очистить поиск" hidden>×</button>
+      </div>
       <select id="sort" class="sort" aria-label="Сортировка">
-        <option value="new">Сначала новые</option>
-        <option value="old">Сначала старые</option>
+        <option value="new">Новые</option>
+        <option value="old">Старые</option>
         <option value="priceDesc">Дороже</option>
         <option value="priceAsc">Дешевле</option>
         <option value="stale">Дольше лежат</option>
+        <option value="profit">Прибыль</option>
       </select>
+      <button id="btn-layout" class="icon-btn layout-btn" type="button" aria-label="Плитка или список" title="Плитка или список">
+        <svg class="ic-list" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+        <svg class="ic-grid" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5" /><rect x="13" y="4" width="7" height="7" rx="1.5" /><rect x="4" y="13" width="7" height="7" rx="1.5" /><rect x="13" y="13" width="7" height="7" rx="1.5" /></svg>
+      </button>
     </div>
     <div id="status-tabs" class="tabs" role="tablist"></div>
     <div id="cat-chips" class="chips"></div>
-    <p id="list-note" class="muted list-note" aria-live="polite"></p>
-    <ul id="items" class="items"></ul>
-    <button id="btn-add" class="fab" type="button">+ Добавить вещь</button>
+    </div>
+    <!-- Панель списка: провести пальцем влево/вправо — соседняя вкладка -->
+    <div id="list-pane" class="list-pane">
+      <p id="list-note" class="muted list-note" aria-live="polite"></p>
+      <ul id="items" class="items"></ul>
+    </div>
+    <!-- Режим выделения (долгое нажатие на строку) -->
+    <div id="select-bar" class="select-bar" hidden>
+      <div class="select-top">
+        <button id="select-cancel" class="link-btn" type="button">Отмена</button>
+        <span id="select-count">Выбрано: 0</span>
+        <button id="select-all" class="link-btn" type="button">Выбрать все</button>
+      </div>
+      <div class="select-actions">
+        <button type="button" data-bulk="buyer">Кто платил</button>
+        <button type="button" data-bulk="status">Статус</button>
+        <button type="button" data-bulk="country">Страна</button>
+        <button type="button" data-bulk="delete" class="danger">Удалить</button>
+      </div>
+    </div>
   </section>
 
   <!-- Карточка вещи -->
   <section id="view-item" class="view" hidden>
     <button class="back" type="button" data-back>‹ Назад</button>
-    <button id="item-photo" class="item-photo" type="button" aria-label="Открыть фото"></button>
+    <!-- Фото: смахнуть влево/вправо — следующая/предыдущая вещь из списка -->
+    <div id="item-photo-wrap" class="item-photo-wrap">
+      <button id="item-photo" class="item-photo" type="button" aria-label="Открыть фото"></button>
+      <span id="item-counter" class="item-counter" hidden></span>
+    </div>
     <div class="item-head">
       <h2 id="item-title"></h2>
       <span id="item-status" class="status"></span>
     </div>
+    <div id="item-chips" class="item-chips"></div>
     <p id="item-price" class="item-bigprice"></p>
+    <p id="item-subprice" class="item-subprice"></p>
     <div id="item-actions" class="actions"></div>
     <div class="actions secondary-actions">
       <button id="btn-edit" type="button">Изменить</button>
@@ -74,7 +114,8 @@
         </label>
         <button id="photo-remove" type="button" class="link-btn" hidden>Убрать фото</button>
       </div>
-      <label>Название *<input name="title" required maxlength="200" autocomplete="off"></label>
+      <h4 class="form-section">Основное</h4>
+      <label>Название *<input name="title" required maxlength="200" autocomplete="off" autocapitalize="sentences" enterkeyhint="next"></label>
       <label>Категория<input name="category" list="dl-category" autocomplete="off"></label>
       <div class="row">
         <label>Бренд<input name="brand" list="dl-brand" autocomplete="off"></label>
@@ -84,6 +125,7 @@
         <label>Состояние<select name="condition" data-list="condition"></select></label>
         <label>Страна<select name="country" data-list="country"></select></label>
       </div>
+      <h4 class="form-section">Закупка</h4>
       <div class="row">
         <label>Источник<select name="source" data-list="source"></select></label>
         <label>Подлинность<select name="authenticity" data-list="authenticity"></select></label>
@@ -102,6 +144,7 @@
         <label>У кого куплено<input name="seller" autocomplete="off"></label>
       </div>
       <label><span id="buydoc-label">Документ закупа</span><input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
+      <h4 class="form-section">Продажа</h4>
       <label>Цена продажи план, ₽<input name="planPrice" type="number" inputmode="numeric" min="0" step="1"></label>
       <p id="markup-hint" class="hint"></p>
       <fieldset id="sale-fields">
@@ -114,7 +157,8 @@
           <label>Деньги получил<select name="soldBy" data-list="partners"></select></label>
         </div>
       </fieldset>
-      <label>Заметки<textarea name="notes" rows="3" maxlength="1000"></textarea></label>
+      <h4 class="form-section">Заметки</h4>
+      <label class="sr-label">Заметки<textarea name="notes" rows="3" maxlength="1000" placeholder="дефекты, комплект, договорённости…"></textarea></label>
       <p id="form-error" class="error" role="alert"></p>
       <button class="primary wide" type="submit" id="form-submit">Сохранить</button>
       <button class="danger-link" type="button" id="btn-delete" hidden>Удалить вещь</button>
@@ -125,13 +169,13 @@
 
   <!-- Статистика -->
   <section id="view-stats" class="view" hidden>
-    <button class="back" type="button" data-back>‹ Назад</button>
-    <h2>Статистика</h2>
+    <h2 id="stats-title">Статистика</h2>
     <div class="tabs stats-switch" role="tablist">
       <button type="button" role="tab" data-stats-tab="general" aria-selected="true">Общая</button>
       <button type="button" role="tab" data-stats-tab="partners" aria-selected="false">Партнёры</button>
     </div>
     <div id="stats-general">
+      <button id="btn-share-report" class="share-report" type="button">📤 Поделиться отчётом за месяц</button>
       <div id="stats-tiles" class="tiles"></div>
       <h3 class="section-title">Прибыль по месяцам</h3>
       <div id="stats-chart" class="chart"></div>
@@ -142,6 +186,11 @@
       <div id="stats-countries" class="table-wrap"></div>
       <h3 class="section-title">Долго лежат</h3>
       <ul id="stats-stale" class="items"></ul>
+    </div>
+    <!-- Журнал: кто что менял -->
+    <div id="stats-journal" hidden>
+      <p class="muted">Последние действия в приложении — нажмите, чтобы открыть вещь.</p>
+      <ul id="stats-history" class="history"><li class="muted">Загрузка…</li></ul>
     </div>
     <div id="stats-partners" hidden>
       <div id="partner-period" class="chips period-chips"></div>
@@ -157,9 +206,11 @@
   <!-- Продажа -->
   <div id="sell-sheet" class="sheet" hidden>
     <form id="sell-form" class="sheet-body" novalidate role="dialog" aria-labelledby="sell-h">
+      <div class="sheet-grip" aria-hidden="true"></div>
       <h3 id="sell-h">Отметить «Продано»</h3>
       <p id="sell-title" class="muted"></p>
       <label>Цена продажи, ₽ *<input name="salePrice" type="number" inputmode="numeric" min="0" step="1" required></label>
+      <div id="sell-quick" class="quick-prices"></div>
       <div class="row">
         <label>Дата продажи<input name="saleDate" type="date"></label>
         <label>Деньги получил<select name="soldBy" data-list="partners"></select></label>
@@ -176,9 +227,32 @@
   <!-- Фото на весь экран -->
   <div id="lightbox" class="lightbox" hidden></div>
 
+  <!-- Выбор значения для массового действия -->
+  <div id="picker-sheet" class="sheet" hidden>
+    <div class="sheet-body" role="dialog" aria-labelledby="picker-title">
+      <h3 id="picker-title"></h3>
+      <div id="picker-list" class="picker-list"></div>
+      <button id="picker-cancel" type="button" class="wide">Отмена</button>
+    </div>
+  </div>
+
+  <!-- Нижняя панель разделов (видна на складе и в статистике) -->
+  <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы">
+    <button type="button" data-nav="list" aria-current="page">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5" /><rect x="13" y="4" width="7" height="7" rx="1.5" /><rect x="4" y="13" width="7" height="7" rx="1.5" /><rect x="13" y="13" width="7" height="7" rx="1.5" /></svg>Склад</button>
+    <button type="button" data-nav="general" id="btn-stats">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7" /></svg>Статистика</button>
+    <button type="button" id="btn-add" class="nav-plus" aria-label="Добавить вещь">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg></button>
+    <button type="button" data-nav="partners">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2" /><path d="M3.5 19c.6-3.2 2.8-5 5.5-5s4.9 1.8 5.5 5" /><circle cx="17" cy="9" r="2.6" /><path d="M16 14.2c2.4.1 4 1.7 4.5 4.8" /></svg>Партнёры</button>
+    <button type="button" data-nav="journal">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7.5V12l3 2" /></svg>Журнал</button>
+  </nav>
+
   <div id="toast" class="toast" hidden role="status"></div>
 
-  <script src="config.js?v=3"></script>
-  <script src="app.js?v=3"></script>
+  <script src="config.js?v=5"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

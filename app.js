@@ -40,6 +40,11 @@ const state = {
   form: { mode: 'add', photo: null, removePhoto: false, dirty: false, hadPhoto: false },
   lastLoad: 0,
   loading: false,
+  pending: 0,
+  seq: 0,             // счётчик локальных изменений (для отбрасывания устаревших ответов)
+  navIds: [],
+  select: null,       // режим выделения: Set выбранных id или null
+  layout: 'grid',     // вид склада: 'grid' — плитка с крупными фото, 'list' — строки
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -145,9 +150,16 @@ const storage = {
   del(key) { try { localStorage.removeItem(key); } catch (e) { /* нет */ } },
 };
 
-function toast(text, ms = 3000) {
+/** Короткое сообщение внизу. action = { label, fn } — кнопка в сообщении (например, «Отменить»). */
+function toast(text, ms = 3000, action) {
   const t = $('#toast');
-  t.textContent = text;
+  t.classList.toggle('with-action', Boolean(action));
+  if (action) {
+    t.replaceChildren(el('span', {}, text), el('button', {
+      type: 'button', class: 'toast-action',
+      onclick: () => { t.hidden = true; clearTimeout(toast.timer); action.fn(); },
+    }, action.label));
+  } else t.textContent = text;
   t.hidden = false;
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => { t.hidden = true; }, ms);
@@ -189,8 +201,24 @@ async function copyText(text) {
 
 // ---------------------------------------------------------------- сервер
 
+// Чтение можно безопасно повторить, запись — нет (иначе возможен дубль вещи).
+const RETRY_ACTIONS = ['list', 'meta', 'photo', 'photos'];
+const RETRY_CODES = ['network', 'busy', 'server'];
+
 async function api(action, payload) {
   if (DEMO) return demoApi(action, payload || {});
+  const attempts = RETRY_ACTIONS.includes(action) ? 3 : 1;
+  for (let i = 0; ; i++) {
+    try {
+      return await apiOnce(action, payload);
+    } catch (e) {
+      if (i + 1 >= attempts || !RETRY_CODES.includes(e.code)) throw e;
+      await new Promise((r) => setTimeout(r, 700 * (i + 1))); // пауза растёт: 0,7 с, 1,4 с
+    }
+  }
+}
+
+async function apiOnce(action, payload) {
   const url = window.APP_CONFIG && window.APP_CONFIG.API_URL;
   if (!url || !url.startsWith('https://')) throw Object.assign(new Error('Не указан адрес сервера в config.js.'), { code: 'setup' });
   let res;
@@ -207,7 +235,11 @@ async function api(action, payload) {
   }
   let body;
   try { body = await res.json(); } catch (e) {
-    throw Object.assign(new Error('Сервер ответил непонятно. Проверьте развертывание Apps Script.'), { code: 'setup' });
+    // Не JSON: 401/403/404 — неверная настройка развертывания; остальное — временный сбой Google.
+    if ([401, 403, 404].includes(res.status)) {
+      throw Object.assign(new Error('Сервер ответил непонятно. Проверьте развертывание Apps Script.'), { code: 'setup' });
+    }
+    throw Object.assign(new Error('Сервер Google временно не ответил. Попробуйте ещё раз.'), { code: 'network' });
   }
   if (!body.ok) throw Object.assign(new Error(body.error || 'Ошибка сервера.'), { code: body.code || '' });
   return body.data;
@@ -217,19 +249,72 @@ async function api(action, payload) {
 
 const VIEWS = ['list', 'item', 'form', 'stats'];
 
+const scrollMemory = {}; // где был экран прокручен, когда с него ушли
+let ignoreScrollUntil = 0; // до этого момента прокрутка — программная (не жест)
+
 function show(view, { push = true } = {}) {
-  if (push && state.view !== view) state.stack.push(state.view);
+  const from = state.view;
+  const changed = from !== view;
+  // Ушли со списка — режим выделения выключается
+  if (changed && view !== 'list' && state.select) {
+    state.select = null;
+    document.body.classList.remove('select-mode');
+    $('#select-bar').hidden = true;
+    $('#btn-add').hidden = false;
+  }
+  if (changed) scrollMemory[from] = window.scrollY;
+  if (push && changed) state.stack.push(from);
   if (view === 'list') state.stack = [];
   state.view = view;
   VIEWS.forEach((v) => { $('#view-' + v).hidden = v !== view; });
-  window.scrollTo(0, 0);
+  document.body.dataset.view = view;
+  syncNav();
+  if (changed) {
+    // Вперёд — экран въезжает справа и сверху страницы; назад — возвращаемся туда, где были.
+    const back = !push;
+    ignoreScrollUntil = Date.now() + 150; // эту прокрутку делаем мы, а не палец
+    window.scrollTo(0, back ? (scrollMemory[view] || 0) : 0);
+    animateView($('#view-' + view), back ? 'enter-back' : 'enter-forward');
+    if (view === 'list') updateStuck(); // вернулись на прокрученный список — тень панели сразу
+  }
   if (tg && tg.BackButton) { if (view === 'list') tg.BackButton.hide(); else tg.BackButton.show(); }
   setClosingGuard(view === 'form' && state.form.dirty);
+  syncMainButton();
+}
+
+// ---- родная кнопка Telegram внизу: в форме это «Сохранить»
+const inTelegram = () => Boolean(tg && tg.initData && tg.MainButton);
+function syncMainButton() {
+  if (!inTelegram()) return;
+  try {
+    const mb = tg.MainButton;
+    if (state.view === 'form') {
+      mb.setText(state.form.mode === 'edit' ? 'Сохранить изменения' : 'Сохранить вещь');
+      mb.show();
+      mb.enable();
+    } else {
+      mb.hideProgress();
+      mb.hide();
+    }
+  } catch (e) { /* старый Telegram — остаётся кнопка на странице */ }
+}
+function mainButtonBusy(on) {
+  if (!inTelegram()) return;
+  try { if (on) tg.MainButton.showProgress(false); else tg.MainButton.hideProgress(); } catch (e) { /* нет */ }
+}
+
+function animateView(node, cls) {
+  node.classList.remove('enter-back', 'enter-forward');
+  void node.offsetWidth; // перезапуск анимации
+  node.classList.add(cls);
+  node.addEventListener('animationend', () => node.classList.remove(cls), { once: true });
 }
 
 async function goBack() {
-  if (!$('#lightbox').hidden) { $('#lightbox').hidden = true; return; }
-  if (!$('#sell-sheet').hidden) { $('#sell-sheet').hidden = true; return; }
+  if (!$('#lightbox').hidden) { closeLightbox(); return; }
+  if (!$('#sell-sheet').hidden) { closeSheet(); return; }
+  if (!$('#picker-sheet').hidden) { $('#picker-sheet').hidden = true; return; }
+  if (state.select && state.view === 'list') { exitSelect(); return; }
   if (state.view === 'form' && state.form.dirty && state.form.mode === 'edit') {
     if (!(await ask('Выйти без сохранения изменений?'))) return;
   }
@@ -254,15 +339,30 @@ function setLoading(on) {
 }
 
 function saveCache() {
+  state.seq++; // любое локальное изменение делает «летящие» ответы сервера устаревшими
   storage.set(CACHE_KEY, { items: state.items, lists: state.lists, user: state.user, partners: state.partners, at: state.lastLoad });
 }
 
-async function loadItems({ silent = false } = {}) {
+async function loadItems({ silent = false, force = false } = {}) {
   if (state.loading) return;
+  // Пока сохраняются изменения, не затираем их старыми данными с сервера (кроме случая конфликта — force).
+  if (state.pending && !force) return;
+  const seq = state.seq;
   setLoading(true);
-  if (!silent && !state.items.length) $('#list-note').textContent = 'Загрузка…';
+  if (!silent && !state.items.length) {
+    $('#list-note').textContent = '';
+    // Серые заготовки строк вместо пустого экрана
+    $('#items').replaceChildren(...Array.from({ length: 6 }, () => el('li', { class: 'skeleton-row', 'aria-hidden': 'true' },
+      el('div', { class: 'thumb loading' }),
+      el('div', { class: 'item-main' }, el('div', { class: 'sk-line w70' }), el('div', { class: 'sk-line w45' })),
+      el('div', { class: 'sk-line w20' }))));
+  }
   try {
-    state.items = await api('list');
+    const fresh = await api('list');
+    // Пока ждали ответ, что-то поменяли на экране — этот ответ уже устарел, не применяем.
+    if (!force && (state.seq !== seq || state.pending)) return;
+    // Вещи, удаление которых ещё можно отменить, не показываем.
+    state.items = pendingDeletes.size ? fresh.filter((i) => !pendingDeletes.has(i.id)) : fresh;
     state.lastLoad = Date.now();
     saveCache();
     // Миниатюры могли поменяться — забываем те, у которых больше нет фото.
@@ -287,8 +387,8 @@ async function handleWriteError(e, errBox) {
   haptic('error');
   if (e.code === 'conflict' || e.code === 'notfound') {
     toast(e.message, 4500);
-    $('#sell-sheet').hidden = true;
-    try { await loadItems({ silent: true }); } catch (err) { /* покажем старое */ }
+    closeSheet();
+    try { await loadItems({ silent: true, force: true }); } catch (err) { /* покажем старое */ }
     if (state.view === 'form') {
       state.form.dirty = false;
       const fresh = state.current && state.items.find((i) => i.id === state.current.id);
@@ -302,26 +402,142 @@ async function handleWriteError(e, errBox) {
 
 // ---------------------------------------------------------------- список
 
+// Ползунок под выбранной вкладкой — один на всё время, чтобы он плавно переезжал, а не появлялся заново
+const tabIndicator = el('span', { class: 'tab-indicator', 'aria-hidden': 'true' });
+const tabIndex = (t) => TABS.indexOf(t);
+
 function renderTabs() {
-  $('#status-tabs').replaceChildren(...TABS.map((t) => {
+  const box = $('#status-tabs');
+  box.replaceChildren(tabIndicator, ...TABS.map((t) => {
     const n = t === 'Все' ? state.items.length : state.items.filter((i) => i.status === t).length;
     return el('button', {
       type: 'button', role: 'tab', 'aria-selected': String(state.tab === t),
-      onclick: () => { state.tab = t; haptic('tap'); renderList(); },
+      onclick: () => switchTab(t),
     }, t, n ? el('span', { class: 'count' }, n) : null);
   }));
+  positionIndicator(tabIndex(state.tab), true);
+  // ширины вкладок могут уточниться после отрисовки списка — догоняем
+  clearTimeout(renderTabs.t);
+  renderTabs.t = setTimeout(() => { if (!state.tabSwiping) positionIndicator(tabIndex(state.tab), true); }, 0);
+}
+
+/** Поставить ползунок на «дробную» вкладку (1.4 — между 2-й и 3-й) — так он едет за пальцем. */
+function positionIndicator(pos, animate) {
+  const box = $('#status-tabs');
+  const btns = [...box.querySelectorAll('button')];
+  if (!btns.length) return;
+  const p = Math.max(0, Math.min(btns.length - 1, pos));
+  const i0 = Math.floor(p), i1 = Math.min(btns.length - 1, i0 + 1), t = p - i0;
+  const b0 = btns[i0], b1 = btns[i1];
+  const x = b0.offsetLeft + (b1.offsetLeft - b0.offsetLeft) * t;
+  const w = b0.offsetWidth + (b1.offsetWidth - b0.offsetWidth) * t;
+  tabIndicator.style.transition = animate ? '' : 'none';
+  tabIndicator.style.width = w + 'px';
+  tabIndicator.style.transform = `translate3d(${x}px, 0, 0)`;
+  // Ближайшая к ползунку вкладка — жирная, пока тянем
+  const near = Math.round(p);
+  btns.forEach((b, i) => b.classList.toggle('near', i === near));
+  // Вкладка за краем полосы — подкрутить полосу, чтобы ползунок был виден
+  if (animate && (x < box.scrollLeft || x + w > box.scrollLeft + box.clientWidth)) {
+    box.scrollTo({ left: Math.max(0, x - 24), behavior: 'smooth' });
+  }
+}
+
+/** Переключить вкладку с анимацией: список уезжает в сторону, новая вкладка въезжает с другой. */
+function switchTab(t) {
+  const from = tabIndex(state.tab), to = tabIndex(t);
+  if (from === to) return;
+  haptic('tap');
+  state.tab = t;
+  renderList();
+  slideList(to > from ? 1 : -1);
+}
+
+function slideList(dir) {
+  const items = $('#list-pane');
+  items.classList.remove('slide-next', 'slide-prev');
+  void items.offsetWidth;
+  items.classList.add(dir > 0 ? 'slide-next' : 'slide-prev');
+  items.addEventListener('animationend', () => items.classList.remove('slide-next', 'slide-prev'), { once: true });
+}
+
+/** Палец по списку влево/вправо — соседняя вкладка; ползунок едет вместе с пальцем. */
+function bindTabSwipe() {
+  const pane = $('#list-pane');
+  let sx = 0, sy = 0, dx = 0, lastX = 0, lastT = 0, speed = 0, tracking = false, horiz = false;
+  pane.addEventListener('pointerdown', (e) => {
+    if (state.select || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    sx = lastX = e.clientX; sy = e.clientY; lastT = performance.now();
+    dx = 0; speed = 0; tracking = true; horiz = false;
+  });
+  pane.addEventListener('pointermove', (e) => {
+    if (!tracking) return;
+    const mx = e.clientX - sx, my = e.clientY - sy;
+    if (!horiz) {
+      if (Math.abs(my) > 10) { tracking = false; return; }            // это прокрутка
+      if (Math.abs(mx) < 12 || Math.abs(mx) < Math.abs(my) * 1.5) return;
+      horiz = true;
+      state.tabSwiping = true;
+      try { pane.setPointerCapture(e.pointerId); } catch (err) { /* синтетика */ }
+      pane.style.transition = 'none';
+    }
+    const now = performance.now();
+    speed = (e.clientX - lastX) / Math.max(1, now - lastT);
+    lastX = e.clientX; lastT = now;
+    const i = tabIndex(state.tab);
+    const edge = (mx > 0 && i === 0) || (mx < 0 && i === TABS.length - 1);
+    dx = edge ? mx * 0.25 : mx;                                         // у крайней вкладки — упругое сопротивление
+    pane.style.transform = `translate3d(${dx}px, 0, 0)`;
+    positionIndicator(i - dx / pane.offsetWidth, false);
+  });
+  const end = (cancelled) => {
+    if (!tracking) return;
+    tracking = false;
+    if (!horiz) return;
+    const width = pane.offsetWidth;
+    const i = tabIndex(state.tab);
+    let target = i;
+    // Переключаем: протянули больше ~четверти ширины или быстро смахнули (но хотя бы на 40 px)
+    const flick = Math.abs(speed) > 0.45 && Math.abs(dx) > 40;
+    if (!cancelled && (Math.abs(dx) > width * 0.22 || flick)) target = i + (dx < 0 ? 1 : -1);
+    target = Math.max(0, Math.min(TABS.length - 1, target));
+    pane.style.transition = '';
+    if (target === i) {
+      pane.style.transform = '';                                        // не дотянули — мягко назад
+      positionIndicator(i, true);
+    } else {
+      const d = target > i ? 1 : -1;
+      pane.style.transform = `translate3d(${-d * width * 0.35}px, 0, 0)`;
+      pane.style.opacity = '0';
+      haptic('tap');
+      setTimeout(() => {
+        state.tab = TABS[target];
+        renderList();
+        pane.style.transition = 'none';
+        pane.style.transform = `translate3d(${d * width * 0.25}px, 0, 0)`;
+        void pane.offsetWidth;
+        pane.style.transition = '';
+        pane.style.transform = '';
+        pane.style.opacity = '';
+      }, 140);
+    }
+    setTimeout(() => { state.tabSwiping = false; }, 50);
+  };
+  pane.addEventListener('pointerup', () => end(false));
+  pane.addEventListener('pointercancel', () => end(true));
 }
 
 function renderChips() {
   const pool = state.tab === 'Все' ? state.items : state.items.filter((i) => i.status === state.tab);
   const cats = [...new Set(pool.map((i) => i.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ru'));
-  if (state.category && !cats.includes(state.category)) cats.unshift(state.category);
+  // Выбранной категории нет в этой вкладке — сбрасываем выбор, а не показываем её с нулём
+  if (state.category && !cats.includes(state.category)) state.category = '';
   const box = $('#cat-chips');
-  box.hidden = cats.length < 2 && !state.category;
+  box.hidden = cats.length < 2;
   box.replaceChildren(...['', ...cats].map((c) => el('button', {
     type: 'button', 'aria-pressed': String(state.category === c),
     onclick: () => { state.category = c; haptic('tap'); renderList(); },
-  }, c || 'Все категории')));
+  }, c || 'Все категории', c ? el('span', { class: 'count' }, pool.filter((i) => i.category === c).length) : null)));
 }
 
 function monthSales(offset = 0) {
@@ -333,18 +549,41 @@ function monthSales(offset = 0) {
   });
 }
 
+/** Подсказка на главном экране: сколько вещей без «Кто платил» (нужно для расчёта партнёров). */
+function renderBuyerHint() {
+  const ids = state.items.filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer && !isCommission(i)).map((i) => i.id);
+  const hint = $('#buyer-hint');
+  hint.hidden = !ids.length || Boolean(state.select);
+  if (!ids.length) return;
+  hint.replaceChildren(el('span', {}, `${pieces(ids.length)} без «Кто платил»`), el('b', {}, 'Указать ›'));
+  hint.onclick = () => bulkFillBuyer(ids);
+}
+
+/** Короткая сумма для карточек: 4,0 млн ₽ / 125 тыс ₽ / 900 ₽. */
+function shortRub(n, signed) {
+  if (!isNum(n)) return '—';
+  const a = Math.abs(n);
+  const sign = signed ? (n > 0 ? '+' : n < 0 ? '−' : '') : (n < 0 ? '−' : '');
+  const fmt = (v, d) => v.toLocaleString('ru-RU', { maximumFractionDigits: d, minimumFractionDigits: d });
+  if (a >= 1e6) return sign + fmt(a / 1e6, a >= 1e7 ? 0 : 1) + ' млн ₽';
+  if (a >= 1e4) return sign + fmt(Math.round(a / 1e3), 0) + ' тыс ₽';
+  return sign + nf.format(Math.round(a)) + ' ₽';
+}
+
 function renderSummary() {
   const unsold = state.items.filter((i) => i.status !== STATUS.sold);
   const transit = unsold.filter((i) => i.status === STATUS.inTransit).length;
   const invested = unsold.reduce((s, i) => s + (i.buyPrice || 0), 0);
   const sold = monthSales();
   const profit = sold.reduce((s, i) => s + (profitOf(i) || 0), 0);
+  const kpi = (label, value, sub, onclick, cls) => el('button', { type: 'button', class: 'kpi', onclick },
+    el('span', { class: 'kpi-label' }, label),
+    el('b', { class: 'kpi-value ' + (cls || '') }, value),
+    sub ? el('span', { class: 'kpi-sub' }, sub) : null);
   $('#summary').replaceChildren(
-    'Не продано ', el('b', {}, pieces(unsold.length)),
-    ...(transit ? [' (в пути ', el('b', {}, transit), ')'] : []),
-    ', вложено ', el('b', {}, rub(invested)), el('br'),
-    'В этом месяце продано ', el('b', {}, pieces(sold.length)), ', прибыль ',
-    el('b', { class: profit < 0 ? 'profit-minus' : '' }, signedRub(profit)), '  ›',
+    kpi('Не продано', String(unsold.length), transit ? 'в пути ' + transit : 'шт.', () => openListTab(STATUS.inStock)),
+    kpi('Вложено', shortRub(invested), 'в непроданном', () => openStats('general')),
+    kpi('Прибыль/мес', shortRub(profit, true), 'продано ' + sold.length, () => openStats('general'), profit < 0 ? 'profit-minus' : profit > 0 ? 'profit-plus' : ''),
   );
 }
 
@@ -354,14 +593,36 @@ const SORTS = {
   priceDesc: (a, b) => priceOf(b) - priceOf(a),
   priceAsc: (a, b) => priceOf(a) - priceOf(b),
   stale: (a, b) => (daysHeld(b) || 0) - (daysHeld(a) || 0),
+  // прибыль: у проданных — фактическая, у остальных — ожидаемая с плановой цены
+  profit: (a, b) => ((profitOf(b) ?? plannedGain(b) ?? -Infinity) - (profitOf(a) ?? plannedGain(a) ?? -Infinity)) || 0,
 };
 function priceOf(i) {
   const v = i.status === STATUS.sold ? i.salePrice : i.planPrice;
   return isNum(v) ? v : -1;
 }
 
+// Русские написания брендов и слов → как они записаны в таблице (поиск по началу слова: «хро» → chrome).
+const SEARCH_ALIASES = {
+  'хром': 'chrome', 'хартс': 'hearts', 'харт': 'heart', 'эрд': 'erd', 'ерд': 'erd', 'энфантс': 'enfants', 'анфан': 'enfants',
+  'баленсиага': 'balenciaga', 'лоро': 'loro', 'пиана': 'piana', 'борис': 'boris', 'биджан': 'bidjan',
+  'сабери': 'saberi', 'кэрол': 'carol', 'кароль': 'carol', 'поэлл': 'poell', 'стон': 'stone', 'стоун': 'stone', 'айленд': 'island',
+  'суприм': 'supreme', 'найк': 'nike', 'данк': 'dunk', 'прада': 'prada', 'гуччи': 'gucci', 'гучи': 'gucci', 'стусси': 'stussy',
+  'нью': 'new', 'беланс': 'balance', 'бэланс': 'balance', 'норт': 'north', 'фейс': 'face', 'мэтти': 'matty', 'мати': 'matty',
+  'худи': 'hoodie', 'лонгслив': 'longsleeve', 'лонг': 'long', 'футболк': 'tee', 'штаны': 'pants', 'брюки': 'pants', 'куртк': 'jacket',
+  'бомбер': 'bomber', 'ботинки': 'boot', 'сапоги': 'boot', 'кроссовки': 'sneaker', 'ремень': 'belt', 'очки': 'sunglasses',
+  'сумка': 'bag', 'рубашка': 'shirt', 'свитшот': 'crewneck', 'шуба': 'fur', 'кожан': 'leather', 'шелк': 'silk', 'шёлк': 'silk',
+};
+/** Слово запроса → варианты для поиска: само слово + английское написание, если начало совпало со словарём. */
+function searchVariants(word) {
+  const out = [word];
+  Object.entries(SEARCH_ALIASES).forEach(([ru, en]) => {
+    if (word.length >= 3 && (ru.startsWith(word) || word.startsWith(ru))) out.push(en);
+  });
+  return out;
+}
+
 function filtered() {
-  const words = state.query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const words = state.query.trim().toLowerCase().split(/\s+/).filter(Boolean).map(searchVariants);
   return state.items
     .map((i, idx) => Object.assign({}, i, { _idx: idx }))
     .filter((i) => {
@@ -370,7 +631,7 @@ function filtered() {
       if (!words.length) return true;
       const hay = [i.title, i.brand, i.size, i.category, i.notes, i.id, i.consignor, i.seller, i.buyer, i.soldBy]
         .join(' ').toLowerCase();
-      return words.every((w) => hay.includes(w));
+      return words.every((variants) => variants.some((v) => hay.includes(v)));
     })
     .sort(SORTS[state.sort] || SORTS.new);
 }
@@ -381,7 +642,7 @@ function itemRow(item, onClick, swipeable) {
   const p = profitOf(item);
   const tags = [];
   if (item.status === STATUS.inTransit && state.tab !== STATUS.inTransit) tags.push(el('span', { class: 'badge info' }, 'В пути'));
-  if (item.status === STATUS.reserved) tags.push(el('span', { class: 'badge warn' }, 'Бронь'));
+  if (item.status === STATUS.reserved && state.tab !== STATUS.reserved) tags.push(el('span', { class: 'badge warn' }, 'Бронь'));
   if (isCommission(item)) {
     tags.push(el('span', { class: 'badge info' }, isNum(item.commissionPct) ? `Комиссия ${item.commissionPct}%` : 'Комиссия'));
   }
@@ -397,115 +658,381 @@ function itemRow(item, onClick, swipeable) {
     sub = isNum(item.buyPrice) ? el('small', { class: 'muted-small' }, 'закуп ' + nf.format(item.buyPrice)) : null;
   }
   const flag = COUNTRY_FLAGS[item.country] ? COUNTRY_FLAGS[item.country] + ' ' : '';
-  const content = el('div', { class: 'item' },
+  const price = rub(item.status === STATUS.sold ? item.salePrice : item.planPrice);
+  const content = swipeable && state.layout === 'grid'
+    ? el('div', { class: 'item card' },
+      el('div', { class: 'card-ph' },
+        thumb,
+        item.size ? el('span', { class: 'card-size' }, item.size) : null,
+        tags.length ? el('div', { class: 'card-tags' }, tags.slice(0, 3)) : null),
+      el('div', { class: 'card-info' },
+        el('div', { class: 'item-title' }, item.title || 'Без названия'),
+        el('div', { class: 'item-sub' }, flag + (item.brand || item.category || '—')),
+        el('div', { class: 'card-price' }, price, sub)))
+    : el('div', { class: 'item' },
     thumb,
     el('div', { class: 'item-main' },
       el('div', { class: 'item-title' }, item.title || 'Без названия'),
       el('div', { class: 'item-sub' }, flag + ([item.brand, item.size, item.category].filter(Boolean).join(' · ') || '—')),
       tags.length ? el('div', { class: 'item-tags' }, tags) : null),
-    el('div', { class: 'item-price' }, rub(item.status === STATUS.sold ? item.salePrice : item.planPrice), sub));
-  const row = el('li', { class: 'swipe-row' }, content);
+    el('div', { class: 'item-price' }, price, sub));
+  const row = el('li', { class: 'swipe-row', 'data-id': item.id }, content);
   content.addEventListener('click', () => {
-    if (row.dataset.swiped) return;              // это был свайп, а не нажатие
-    if (row.classList.contains('open')) { closeSwipe(row); return; }
+    if (row.dataset.swiped || state.tabSwiping) return; // долгое нажатие или листание вкладок, а не тап
+    if (state.select) { toggleSelect(item.id); return; }
     (onClick || (() => openItem(item.id)))();
   });
   if (swipeable) {
-    const del = el('button', { type: 'button', class: 'swipe-delete', 'aria-label': 'Удалить ' + item.title, onclick: () => deleteItem(item) }, 'Удалить');
-    row.prepend(del);
-    enableSwipe(row, content);
+    if (state.select && state.select.has(item.id)) row.classList.add('selected');
+    enableLongPress(row, content, item.id);
   }
   return row;
 }
 
-// ---------------------------------------------------------------- свайп влево → «Удалить»
+// ---------------------------------------------------------------- потянуть вниз → обновить
 
-const SWIPE_OPEN = 88; // ширина красной кнопки
-let openSwipeRow = null;
+const PTR_TRIGGER = 70; // px — достаточно потянули
 
-function closeSwipe(row) {
-  if (!row) return;
-  row.classList.remove('open');
-  row.querySelector('.item').style.transform = '';
-  if (openSwipeRow === row) openSwipeRow = null;
-}
-
-function enableSwipe(row, content) {
-  let startX = 0, startY = 0, dx = 0, base = 0, tracking = false, decided = false, horizontal = false;
-  content.addEventListener('pointerdown', (e) => {
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    startX = e.clientX; startY = e.clientY; dx = 0;
-    base = row.classList.contains('open') ? -SWIPE_OPEN : 0;
-    tracking = true; decided = false; horizontal = false;
-  });
-  content.addEventListener('pointermove', (e) => {
-    if (!tracking) return;
-    const mx = e.clientX - startX, my = e.clientY - startY;
-    if (!decided) {
-      if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
-      decided = true;
-      horizontal = Math.abs(mx) > Math.abs(my);
-      if (!horizontal) { tracking = false; return; } // вертикально — обычная прокрутка
-      try { content.setPointerCapture(e.pointerId); } catch (err) { /* синтетические события */ }
-      if (openSwipeRow && openSwipeRow !== row) closeSwipe(openSwipeRow);
-      row.dataset.swiped = '1';
-      content.style.transition = 'none';
-    }
-    dx = Math.min(0, Math.max(-SWIPE_OPEN * 1.5, base + mx));
-    content.style.transform = `translateX(${dx}px)`;
-  });
-  const finish = () => {
-    if (!tracking) return;
-    tracking = false;
-    if (!horizontal) return;
-    content.style.transition = '';
-    if (dx < -SWIPE_OPEN / 2) {
-      row.classList.add('open');
-      content.style.transform = `translateX(${-SWIPE_OPEN}px)`;
-      openSwipeRow = row;
-      haptic('tap');
-    } else closeSwipe(row);
-    setTimeout(() => { delete row.dataset.swiped; }, 0); // гасим «клик» после свайпа
+function enablePullToRefresh() {
+  const ind = document.getElementById('ptr');
+  let startX = 0, startY = 0, pull = 0, active = false, decided = false;
+  const setPull = (px) => {
+    pull = px;
+    const p = Math.min(1, px / PTR_TRIGGER);
+    ind.style.transform = `translate3d(-50%, ${Math.min(px, PTR_TRIGGER * 1.4) - 48}px, 0) rotate(${p * 270}deg)`;
+    ind.style.opacity = String(p);
+    const ready = px >= PTR_TRIGGER;
+    if (ready && !ind.classList.contains('ready')) haptic('tap'); // дотянули — лёгкий отклик
+    ind.classList.toggle('ready', ready);
   };
-  content.addEventListener('pointerup', finish);
-  content.addEventListener('pointercancel', finish);
+  document.addEventListener('touchstart', (e) => {
+    if (state.view !== 'list' || window.scrollY > 0 || state.loading || e.touches.length !== 1) { active = false; return; }
+    if (e.target.closest('.swipe-row.open, input, select, textarea')) { active = false; return; }
+    startX = e.touches[0].clientX; startY = e.touches[0].clientY;
+    active = true; decided = false; pull = 0;
+  }, { passive: true });
+  document.addEventListener('touchmove', (e) => {
+    if (!active) return;
+    const dx = e.touches[0].clientX - startX, dy = e.touches[0].clientY - startY;
+    if (!decided) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      decided = true;
+      // Только явное движение вниз от самого верха страницы
+      if (dy <= 0 || Math.abs(dy) < Math.abs(dx) * 1.5 || window.scrollY > 0) { active = false; return; }
+      ind.classList.add('pulling');
+    }
+    setPull(Math.max(0, dy * 0.55)); // сопротивление: индикатор идёт медленнее пальца
+  }, { passive: true });
+  const end = async () => {
+    if (!active) return;
+    active = false;
+    ind.classList.remove('pulling');
+    if (pull >= PTR_TRIGGER) {
+      haptic('tap');
+      ind.classList.add('spinning');
+      setPull(PTR_TRIGGER);
+      try { await loadItems({ silent: true }); toast('Обновлено'); } catch (err) { toast(err.message); }
+      ind.classList.remove('spinning');
+    }
+    ind.style.transform = '';
+    ind.style.opacity = '0';
+    ind.classList.remove('ready');
+  };
+  document.addEventListener('touchend', end, { passive: true });
+  document.addEventListener('touchcancel', end, { passive: true });
 }
 
-/** Удаление вещи (из свайпа, карточки или формы) с подтверждением. */
-async function deleteItem(item) {
-  if (!(await ask(`Удалить «${item.title}» из таблицы? Фото уйдёт в корзину Google Диска.`))) {
-    closeSwipe(openSwipeRow);
-    return false;
+// ---------------------------------------------------------------- выделение нескольких вещей
+
+const LONG_PRESS_MS = 450;
+
+/** Долгое нажатие на строку включает режим выделения. */
+function enableLongPress(row, content, id) {
+  let timer = 0, sx = 0, sy = 0;
+  const cancel = () => { clearTimeout(timer); timer = 0; };
+  content.addEventListener('pointerdown', (e) => {
+    if (state.select || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    sx = e.clientX; sy = e.clientY;
+    timer = setTimeout(() => {
+      timer = 0;
+      row.dataset.swiped = '1';             // не открывать карточку отпусканием пальца
+      setTimeout(() => { delete row.dataset.swiped; }, 400);
+      haptic('success');
+      enterSelect(id);
+    }, LONG_PRESS_MS);
+  });
+  content.addEventListener('pointermove', (e) => { if (timer && Math.hypot(e.clientX - sx, e.clientY - sy) > 8) cancel(); });
+  content.addEventListener('pointerup', cancel);
+  content.addEventListener('pointercancel', cancel);
+  content.addEventListener('contextmenu', (e) => { if (timer || state.select) e.preventDefault(); });
+}
+
+function enterSelect(firstId) {
+  state.select = new Set(firstId ? [firstId] : []);
+  document.body.classList.add('select-mode');
+  renderList();
+  syncSelectBar();
+}
+
+function exitSelect() {
+  state.select = null;
+  document.body.classList.remove('select-mode');
+  renderList();
+  syncSelectBar();
+}
+
+function toggleSelect(id) {
+  if (!state.select) return;
+  if (state.select.has(id)) state.select.delete(id); else state.select.add(id);
+  haptic('tap');
+  const row = document.querySelector(`#items .swipe-row[data-id="${CSS.escape(id)}"]`);
+  if (row) row.classList.toggle('selected', state.select.has(id));
+  syncSelectBar();
+}
+
+function selectAllVisible() {
+  if (!state.select) return;
+  const ids = filtered().map((i) => i.id);
+  const all = ids.length > 0 && ids.every((id) => state.select.has(id));
+  ids.forEach((id) => { if (all) state.select.delete(id); else state.select.add(id); });
+  renderList();
+  syncSelectBar();
+}
+
+function syncSelectBar() {
+  const bar = $('#select-bar');
+  const on = Boolean(state.select);
+  bar.hidden = !on;
+  $('#btn-add').hidden = on;
+  if (tg && tg.BackButton && state.view === 'list') {
+    try { if (on) tg.BackButton.show(); else tg.BackButton.hide(); } catch (e) { /* нет */ }
   }
+  if (!on) return;
+  const n = state.select.size;
+  $('#select-count').textContent = n ? `Выбрано: ${n}` : 'Выберите вещи';
+  const visible = filtered().map((i) => i.id);
+  $('#select-all').textContent = visible.length && visible.every((id) => state.select.has(id)) ? 'Снять все' : 'Выбрать все';
+  bar.querySelectorAll('[data-bulk]').forEach((b) => { b.disabled = n === 0; });
+}
+
+/** Шторка выбора значения для массового действия. */
+function openPicker(title, options, onPick) {
+  const sheet = $('#picker-sheet');
+  $('#picker-title').textContent = title;
+  $('#picker-list').replaceChildren(...options.map(([value, label]) => el('button', {
+    type: 'button', class: 'picker-option',
+    onclick: () => { sheet.hidden = true; onPick(value); },
+  }, label)));
+  sheet.hidden = false;
+}
+
+const BULK_LABELS = { buyer: 'Кто платил', status: 'Статус', country: 'Страна', category: 'Категория' };
+
+function bulkPick(field) {
+  const n = state.select ? state.select.size : 0;
+  if (!n) return;
+  let options;
+  if (field === 'buyer') options = [...walletList().map((p) => [p, walletLabel(p)]), ['', '— не указано']];
+  else if (field === 'status') options = [STATUS.inTransit, STATUS.inStock, STATUS.reserved].map((s) => [s, s]);
+  else if (field === 'country') {
+    options = [...(state.lists.country || DEFAULT_LISTS.country).map((c) => [c, withFlag(c)]), ['', '— не указано']];
+  } else options = (state.lists.category || []).map((c) => [c, c]);
+  openPicker(`${BULK_LABELS[field]} — для ${pieces(n)}`, options, (value) => applyBulk(field, value));
+}
+
+/** Массовое изменение: сразу на экране, сервер в фоне, при ошибке — откат. */
+async function applyBulk(field, value) {
+  const ids = [...state.select];
+  const targets = state.items.filter((i) => ids.includes(i.id) && !(field === 'status' && i.status === STATUS.sold));
+  const before = targets.map((i) => ({ ...i }));
+  targets.forEach((i) => {
+    i[field] = value;
+    if (field === 'status') Object.assign(i, { salePrice: null, saleDate: '', soldBy: '' });
+  });
+  const skipped = ids.length - targets.length;
+  state.pending++;
+  saveCache();
+  exitSelect();
+  haptic('success');
+  toast(`${BULK_LABELS[field]}: ${value || 'не указано'} — ${pieces(targets.length)}`
+    + (skipped ? ` (проданные не тронуты: ${skipped})` : ''));
   try {
-    await api('delete', { id: item.id, version: item.changedAt });
-    state.form.dirty = false;
-    haptic('success');
-    toast('Удалено');
-    if (state.view !== 'list') show('list');
-    await loadItems({ silent: true });
-    return true;
+    await api('bulkUpdate', { ids, patch: { [field]: value } });
+    state.pending--;
+    if (!state.pending) await loadItems({ silent: true });
   } catch (e) {
-    handleWriteError(e, state.view === 'form' ? $('#form-error') : null);
-    return false;
+    state.pending--;
+    targets.forEach((i, k) => { Object.keys(i).forEach((key) => delete i[key]); Object.assign(i, before[k]); });
+    saveCache();
+    renderList();
+    handleWriteError(e);
   }
+}
+
+/** Из «Партнёры»: открыть список, выделить вещи без «Кто платил» и сразу спросить партнёра. */
+function bulkFillBuyer(ids) {
+  state.tab = 'Все';
+  state.category = '';
+  state.query = '';
+  $('#search').value = '';
+  $('#search-clear').hidden = true;
+  show('list');
+  enterSelect();
+  ids.forEach((id) => state.select.add(id));
+  renderList();
+  syncSelectBar();
+  bulkPick('buyer');
+}
+
+async function bulkDelete() {
+  const ids = [...state.select];
+  if (!ids.length) return;
+  if (!(await ask(`Удалить ${pieces(ids.length)} из таблицы? Фото уйдут в корзину Google Диска.`))) return;
+  const removed = state.items.filter((i) => ids.includes(i.id));
+  const snapshot = state.items.slice();
+  state.items = state.items.filter((i) => !ids.includes(i.id));
+  state.pending++;
+  saveCache();
+  exitSelect();
+  haptic('success');
+  toast(`Удалено: ${pieces(removed.length)}`);
+  try {
+    await api('bulkDelete', { ids });
+    state.pending--;
+    if (!state.pending) await loadItems({ silent: true });
+  } catch (e) {
+    state.pending--;
+    state.items = snapshot;
+    saveCache();
+    renderList();
+    handleWriteError(e);
+  }
+}
+
+// ---------------------------------------------------------------- прокрутка
+
+// Тень у панели поиска, когда она прилипла к верху: метка над панелью ушла за экран.
+function updateStuck() {
+  const sentinel = document.getElementById('toolbar-sentinel');
+  if (!sentinel || state.view !== 'list') return;
+  document.getElementById('toolbar').classList.toggle('stuck', sentinel.getBoundingClientRect().top < 0);
+}
+if ('IntersectionObserver' in window) {
+  new IntersectionObserver(updateStuck).observe(document.getElementById('toolbar-sentinel'));
+}
+
+// Работа при прокрутке — не чаще раза в кадр (~16 мс), чтобы листание не подтормаживало.
+let lastScrollY = 0;
+let scrollQueued = false;
+function onScrollFrame() {
+  scrollQueued = false;
+  updateStuck();
+  lastScrollY = window.scrollY;
+}
+window.addEventListener('scroll', () => {
+  if (scrollQueued) return;
+  scrollQueued = true;
+  setTimeout(onScrollFrame, 16);
+}, { passive: true });
+
+const UNDO_MS = 5000;          // сколько секунд можно отменить удаление
+const pendingDeletes = new Map(); // id → функция «удалить на сервере прямо сейчас»
+
+/**
+ * Удаление вещи (из свайпа, карточки или формы): строка сразу исчезает, внизу «Отменить» на 5 секунд.
+ * На сервер удаление уходит после этого (или сразу, если приложение сворачивают).
+ */
+async function deleteItem(stale) {
+  // Ищем по ID: пока была открыта форма, список мог обновиться и объект смениться.
+  const index = state.items.findIndex((i) => i.id === stale.id);
+  const item = index !== -1 ? state.items[index] : stale;
+  const version = item.changedAt;
+  const row = document.querySelector(`.swipe-row[data-id="${CSS.escape(item.id)}"]`);
+  state.form.dirty = false;
+  haptic('success');
+  if (row && state.view === 'list') {
+    row.style.height = row.offsetHeight + 'px';
+    void row.offsetHeight;
+    row.classList.add('removing');
+    await new Promise((r) => setTimeout(r, 220));
+  }
+  if (index !== -1) state.items.splice(index, 1);
+  state.pending++;
+  saveCache();
+  if (state.view !== 'list') show('list');
+  renderList();
+
+  let done = false;
+  const restore = () => {
+    if (index !== -1 && !state.items.includes(item)) state.items.splice(Math.min(index, state.items.length), 0, item);
+    saveCache();
+    renderList();
+  };
+  const commit = async () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    pendingDeletes.delete(item.id);
+    saveCache();
+    try {
+      await api('delete', { id: item.id, version });
+      state.pending--;
+      if (!state.pending) await loadItems({ silent: true });
+    } catch (e) {
+      state.pending--;
+      restore();
+      handleWriteError(e);
+    }
+  };
+  const timer = setTimeout(commit, UNDO_MS);
+  pendingDeletes.set(item.id, commit);
+  toast(`Удалено: ${item.title}`, UNDO_MS, {
+    label: 'Отменить',
+    fn: () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      pendingDeletes.delete(item.id);
+      state.pending--;
+      restore();
+      haptic('tap');
+    },
+  });
+  return true;
+}
+
+/** Приложение сворачивают — отложенные удаления отправляем сразу, чтобы не потерялись. */
+function flushPendingDeletes() {
+  [...pendingDeletes.values()].forEach((commit) => commit());
 }
 
 function renderList() {
   renderTabs();
   renderChips();
   renderSummary();
+  renderBuyerHint();
   const list = filtered();
   const note = $('#list-note');
   const box = $('#items');
+  box.classList.toggle('grid', state.layout === 'grid' && list.length > 0);
 
   if (!list.length) {
     note.textContent = '';
-    const empty = state.items.length
-      ? el('div', { class: 'empty' }, icon('box'), el('p', {}, 'Ничего не найдено'),
-        (state.query || state.category) ? el('button', { type: 'button', onclick: resetFilters }, 'Сбросить фильтры') : null)
-      : el('div', { class: 'empty' }, icon('box'), el('p', {}, 'Вещей пока нет'),
-        el('button', { type: 'button', class: 'primary', onclick: () => openForm('add') }, 'Добавить первую'));
+    // Пустая вкладка — объясняем, что здесь бывает и как сюда попасть
+    const TAB_HINTS = {
+      [STATUS.inTransit]: ['Ничего не едет', 'Здесь вещи, которые оплачены, но ещё в пути. При добавлении выберите статус «В пути».'],
+      [STATUS.inStock]: ['В наличии пусто', 'Добавьте вещь или отметьте «Получена» у той, что в пути.'],
+      [STATUS.reserved]: ['Броней нет', 'Отложить вещь для покупателя — «В бронь» в её карточке.'],
+      [STATUS.sold]: ['Продаж пока нет', 'Отметьте продажу кнопкой «Продано» в карточке вещи.'],
+    };
+    const filteredOut = state.query || state.category;
+    const [title, text] = !state.items.length ? ['Вещей пока нет', 'Начните с первой — фото, название и цена закупа.']
+      : filteredOut ? ['Ничего не найдено', state.query ? `По запросу «${state.query.trim()}» в этой вкладке ничего нет.` : 'В этой категории здесь ничего нет.']
+        : (TAB_HINTS[state.tab] || ['Пусто', '']);
+    const empty = el('div', { class: 'empty' }, icon('box'), el('b', { class: 'empty-title' }, title), text ? el('p', {}, text) : null,
+      filteredOut ? el('button', { type: 'button', onclick: resetFilters }, 'Сбросить фильтры') : null,
+      !state.items.length ? el('button', { type: 'button', class: 'primary', onclick: () => openForm('add') }, 'Добавить первую') : null,
+      filteredOut && state.tab !== 'Все' ? el('button', { type: 'button', class: 'link-btn', onclick: () => switchTab('Все') }, 'Искать во всех вкладках') : null);
     box.replaceChildren(el('li', {}, empty));
     return;
   }
@@ -517,8 +1044,9 @@ function renderList() {
     const plan = list.reduce((s, i) => s + (i.planPrice || 0), 0);
     note.textContent = list.length > 1 ? `${pieces(list.length)}, план продаж ${rub(plan)}` : '';
   }
-  openSwipeRow = null;
-  box.replaceChildren(...list.map((item) => itemRow(item, null, true)));
+  if (state.query.trim()) note.textContent = `Найдено: ${pieces(list.length)}`;
+  const ids = list.map((i) => i.id); // порядок для пролистывания карточек
+  box.replaceChildren(...list.map((item) => itemRow(item, () => { state.navIds = ids; openItem(item.id); }, true)));
 }
 
 function resetFilters() {
@@ -553,7 +1081,8 @@ function queuePhoto(id, box) {
   box.dataset.photo = id;
   if (state.photos.has(id)) { putPhoto(box, state.photos.get(id)); return; }
   if (!photoQueue.some((q) => q.id === id)) photoQueue.push({ id });
-  pumpPhotos();
+  // Чуть подождать, чтобы собрать в один запрос все строки, появившиеся на экране разом
+  if (!queuePhoto.timer) queuePhoto.timer = setTimeout(() => { queuePhoto.timer = 0; pumpPhotos(); }, 16);
 }
 function putPhoto(box, src) {
   box.classList.remove('loading');
@@ -567,17 +1096,28 @@ function paintPhoto(id, src) {
     putPhoto(b, src);
   });
 }
+// Миниатюры — пачками по 8 одним запросом (сервер отвечает ~1 с на запрос, а не на фото), 2 запроса параллельно.
+const PHOTO_BATCH = 8;
+const PHOTO_PARALLEL = 2;
 function pumpPhotos() {
-  while (photoActive < 3 && photoQueue.length) {
-    const { id } = photoQueue.shift();
-    if (state.photos.has(id)) { paintPhoto(id, state.photos.get(id)); continue; }
+  while (photoActive < PHOTO_PARALLEL && photoQueue.length) {
+    const batch = [];
+    while (batch.length < PHOTO_BATCH && photoQueue.length) {
+      const { id } = photoQueue.shift();
+      if (state.photos.has(id)) paintPhoto(id, state.photos.get(id));
+      else if (!batch.includes(id)) batch.push(id);
+    }
+    if (!batch.length) continue;
     photoActive++;
-    api('photo', { id })
-      .then((ph) => (ph ? `data:${ph.mime};base64,${ph.base64}` : null))
-      .catch(() => null)
-      .then((src) => {
-        state.photos.set(id, src);
-        paintPhoto(id, src);
+    api('photos', { ids: batch })
+      .catch(() => ({}))
+      .then((res) => {
+        batch.forEach((id) => {
+          const ph = res && res[id];
+          const src = ph ? `data:${ph.mime};base64,${ph.base64}` : null;
+          state.photos.set(id, src);
+          paintPhoto(id, src);
+        });
         photoActive--;
         pumpPhotos();
       });
@@ -593,21 +1133,100 @@ async function loadFullPhoto(id) {
   } catch (e) { return null; }
 }
 
+// ---- просмотр фото: двойное нажатие — увеличить, смахнуть вниз — закрыть, нажатие — закрыть
+const lightbox = { scale: 1, tx: 0, ty: 0, lastTap: 0, closeTimer: 0, moved: false };
+
+function lbImage() { return $('#lightbox img'); }
+function lbApply(animate) {
+  const img = lbImage();
+  if (!img) return;
+  img.style.transition = animate ? 'transform .25s cubic-bezier(.2,.8,.2,1)' : 'none';
+  img.style.transform = `translate3d(${lightbox.tx}px, ${lightbox.ty}px, 0) scale(${lightbox.scale})`;
+}
+
 function openLightbox() {
   const item = state.current;
   if (!item || !item.hasPhoto) return;
   const lb = $('#lightbox');
   const src = state.fullPhotos.get(item.id) || state.photos.get(item.id);
-  lb.replaceChildren(src ? el('img', { src, alt: item.title }) : el('p', {}, 'Загрузка…'));
+  Object.assign(lightbox, { scale: 1, tx: 0, ty: 0, lastTap: 0, moved: false });
+  lb.style.background = '';
+  lb.replaceChildren(src ? el('img', { src, alt: item.title, draggable: 'false' }) : el('p', {}, 'Загрузка…'));
+  lb.classList.remove('closing');
   lb.hidden = false;
-  loadFullPhoto(item.id).then((full) => { if (full && !lb.hidden) lb.replaceChildren(el('img', { src: full, alt: item.title })); });
+  loadFullPhoto(item.id).then((full) => {
+    if (full && !lb.hidden) { lb.replaceChildren(el('img', { src: full, alt: item.title, draggable: 'false' })); lbApply(false); }
+  });
+}
+
+function closeLightbox() {
+  const lb = $('#lightbox');
+  if (lb.hidden) return;
+  lb.classList.add('closing');
+  setTimeout(() => { lb.hidden = true; lb.classList.remove('closing'); lb.style.background = ''; }, 180);
+}
+
+function bindLightbox() {
+  const lb = $('#lightbox');
+  let sx = 0, sy = 0, bx = 0, by = 0, dragging = false;
+  lb.addEventListener('pointerdown', (e) => {
+    if (!lbImage()) return;
+    dragging = true; lightbox.moved = false;
+    sx = e.clientX; sy = e.clientY; bx = lightbox.tx; by = lightbox.ty;
+    try { lb.setPointerCapture(e.pointerId); } catch (err) { /* синтетические события */ }
+  });
+  lb.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - sx, dy = e.clientY - sy;
+    if (!lightbox.moved && Math.hypot(dx, dy) < 6) return;
+    lightbox.moved = true;
+    if (lightbox.scale > 1) { lightbox.tx = bx + dx; lightbox.ty = by + dy; }  // увеличено — двигаем фото
+    else {                                                                      // обычный размер — тянем вниз/вверх
+      lightbox.tx = 0; lightbox.ty = dy;
+      lb.style.background = `rgba(0,0,0,${Math.max(0.25, 1 - Math.abs(dy) / 400)})`;
+    }
+    lbApply(false);
+  });
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    if (!lightbox.moved) return;
+    if (lightbox.scale === 1) {
+      if (Math.abs(lightbox.ty) > 110) { closeLightbox(); return; }       // смахнули — закрыть
+      lightbox.ty = 0; lb.style.background = ''; lbApply(true);           // не дотянули — вернуть
+    }
+  };
+  lb.addEventListener('pointerup', end);
+  lb.addEventListener('pointercancel', end);
+  lb.addEventListener('click', (e) => {
+    if (lightbox.moved) { lightbox.moved = false; return; } // это было перетаскивание
+    const now = Date.now();
+    if (now - lightbox.lastTap < 300) {
+      // Двойное нажатие: увеличить в точке нажатия / вернуть
+      clearTimeout(lightbox.closeTimer);
+      lightbox.lastTap = 0;
+      if (lightbox.scale === 1) {
+        const img = lbImage();
+        if (!img) return;
+        const r = img.getBoundingClientRect();
+        lightbox.scale = 2;
+        lightbox.tx = (r.left + r.width / 2 - e.clientX);
+        lightbox.ty = (r.top + r.height / 2 - e.clientY);
+      } else Object.assign(lightbox, { scale: 1, tx: 0, ty: 0 });
+      lbApply(true);
+      return;
+    }
+    lightbox.lastTap = now;
+    // Одиночное нажатие закрывает (ждём — вдруг это начало двойного)
+    if (lightbox.scale === 1) lightbox.closeTimer = setTimeout(closeLightbox, 300);
+  });
 }
 
 // ---------------------------------------------------------------- карточка
 
 const ITEM_FIELDS = [
-  ['category', 'Категория'], ['brand', 'Бренд'], ['size', 'Размер'], ['condition', 'Состояние'],
-  ['country', 'Страна', withFlag], ['authenticity', 'Подлинность'], ['source', 'Источник'], ['consignor', 'Комитент'],
+  // бренд, размер, состояние и страна — метками над ценой, в таблице не дублируем
+  ['category', 'Категория'], ['authenticity', 'Подлинность'], ['source', 'Источник'], ['consignor', 'Комитент'],
   ['commissionPct', 'Комиссия', (v) => `${v}%`],
   ['buyPrice', 'Закуп', rub], ['buyDate', 'Дата закупа'], ['buyer', 'Кто платил'], ['seller', 'У кого куплено'],
   ['buyDoc', 'Документ'], ['planPrice', 'План продажи', rub], ['salePrice', 'Продано за', rub], ['saleDate', 'Дата продажи'],
@@ -623,6 +1242,14 @@ function openItem(id, opts) {
   if (!item) return;
   state.current = item;
   $('#item-title').textContent = item.title || 'Без названия';
+  // Короткие метки: главное о вещи одной строкой
+  $('#item-chips').replaceChildren(...[item.brand, item.size ? 'Размер ' + item.size : '', item.condition, withFlag(item.country)]
+    .filter(Boolean).map((t) => el('span', { class: 'chip' }, t)));
+  // Счётчик «3 / 9» — если открыто из списка
+  const nav = state.navIds.indexOf(item.id);
+  const counter = $('#item-counter');
+  counter.hidden = !(nav !== -1 && state.navIds.length > 1);
+  counter.textContent = nav !== -1 ? `${nav + 1} / ${state.navIds.length}` : '';
   const st = $('#item-status');
   st.textContent = item.status || '—';
   st.className = 'status ' + (STATUS_CLASS[item.status] || '');
@@ -657,11 +1284,28 @@ function openItem(id, opts) {
     const label = isCommission(item) ? 'наша комиссия' : 'наценка';
     big.replaceChildren(rub(item.planPrice), gain !== null ? el('small', { class: 'muted-inline' }, `${label} ${signedRub(gain)}`) : null);
   }
+  // Строка под ценой: закуп или комиссия
+  const sub = [];
+  if (isCommission(item)) {
+    if (item.consignor) sub.push('комитент ' + item.consignor);
+    if (isNum(item.commissionPct)) sub.push(`комиссия ${item.commissionPct}%`);
+  } else if (isNum(item.buyPrice)) sub.push('закуп ' + rub(item.buyPrice));
+  if (!isCommission(item) && item.buyer) sub.push(item.buyer === COMMON ? 'из общей кассы' : 'платил ' + item.buyer);
+  if (item.status === STATUS.sold && item.saleDate) sub.push('продано ' + item.saleDate);
+  if (item.status === STATUS.sold && item.soldBy) sub.push(item.soldBy === COMMON ? 'деньги в кассе' : 'деньги у ' + item.soldBy);
+  const subBox = $('#item-subprice');
+  subBox.replaceChildren(sub.join(' · '));
+  // Не указано, кто платил, — ссылка «указать» прямо здесь (одно нажатие вместо «Изменить»)
+  if (!isCommission(item) && !item.buyer && isNum(item.buyPrice) && item.buyPrice > 0) {
+    subBox.append(sub.length ? ' · ' : '', el('button', { type: 'button', class: 'inline-link', onclick: () => pickBuyer(item) }, 'указать, кто платил'));
+  }
 
   const rows = [];
   ITEM_FIELDS.forEach(([key, label, fmt]) => {
     const v = item[key];
     if (v === '' || v === null || v === undefined) return;
+    if (key === 'buyPrice') return;                                    // закуп — уже под ценой
+    if (key === 'planPrice' && item.status !== STATUS.sold) return;   // план — это и есть большая цена
     rows.push(el('dt', {}, label), el('dd', {}, fmt ? fmt(v) : v));
   });
   if (isCommission(item)) {
@@ -697,31 +1341,161 @@ function openItem(id, opts) {
   show('item', opts);
 }
 
+/** Следующая (+1) / предыдущая (−1) вещь текущего списка. */
+function navItem(dir) {
+  const ids = state.navIds;
+  const i = state.current ? ids.indexOf(state.current.id) : -1;
+  if (i === -1 || ids.length < 2) return false;
+  const next = ids[(i + dir + ids.length) % ids.length];
+  if (!state.items.some((it) => it.id === next)) return false;
+  openItem(next, { push: false });
+  ignoreScrollUntil = Date.now() + 150;
+  window.scrollTo(0, 0);
+  animateView($('#view-item'), dir > 0 ? 'enter-forward' : 'enter-back');
+  haptic('tap');
+  return true;
+}
+
+/** Смахивание фото в карточке влево/вправо листает вещи. */
+function bindPhotoSwipe() {
+  const wrap = $('#item-photo-wrap');
+  let sx = 0, sy = 0, tracking = false, horizontal = false, dx = 0;
+  wrap.addEventListener('pointerdown', (e) => { sx = e.clientX; sy = e.clientY; dx = 0; tracking = true; horizontal = false; });
+  wrap.addEventListener('pointermove', (e) => {
+    if (!tracking) return;
+    const mx = e.clientX - sx, my = e.clientY - sy;
+    if (!horizontal) {
+      if (Math.abs(my) > 10) { tracking = false; return; }
+      if (Math.abs(mx) < 14 || Math.abs(mx) < Math.abs(my) * 2) return;
+      horizontal = true;
+      try { wrap.setPointerCapture(e.pointerId); } catch (err) { /* синтетика */ }
+      wrap.dataset.swiped = '1';
+    }
+    dx = mx;
+    $('#item-photo').style.transform = `translate3d(${mx * 0.35}px,0,0)`;
+  });
+  const end = () => {
+    if (!tracking) return;
+    tracking = false;
+    $('#item-photo').style.transform = '';
+    if (!horizontal) return;
+    if (Math.abs(dx) > 50) navItem(dx < 0 ? 1 : -1);
+    setTimeout(() => { delete wrap.dataset.swiped; }, 0);
+  };
+  wrap.addEventListener('pointerup', end);
+  wrap.addEventListener('pointercancel', end);
+}
+
 /** −10% с округлением вниз до сотни. */
 const discounted = (price) => Math.floor((price * 0.9) / 100) * 100;
+
+/**
+ * «Сразу показать, сохранить в фоне»: изменение видно мгновенно, сервер (1–2 с) догоняет.
+ * Если сервер откажет — возвращаем как было и показываем причину.
+ */
+async function optimistic(stale, patch, call, okMessage, undoTo) {
+  const item = state.items.find((i) => i.id === stale.id) || stale; // актуальный объект из списка
+  const before = { ...item };
+  Object.assign(item, patch);
+  state.pending++;
+  saveCache();
+  refreshCurrentView();
+  haptic('success');
+  // undoTo — статус, к которому вернёт «Отменить» (только «В пути» / «В наличии» / «Бронь»)
+  let resolveSaved;
+  const saved = new Promise((r) => { resolveSaved = r; });
+  const canUndo = [STATUS.inTransit, STATUS.inStock, STATUS.reserved].includes(undoTo);
+  toast(okMessage, canUndo ? 5000 : 3000, canUndo ? {
+    label: 'Отменить',
+    fn: async () => {
+      if (!(await saved)) return; // сохранение не прошло — откатилось само
+      const live = state.items.find((i) => i.id === item.id) || item;
+      optimistic(live, { status: undoTo, salePrice: null, saleDate: '', soldBy: '' },
+        () => api('setStatus', { id: live.id, status: undoTo, version: live.changedAt }), `Отменено — снова «${undoTo}»`);
+    },
+  } : undefined);
+  try {
+    const res = await call();
+    // Сервер вернул новую версию — следующее действие с вещью пройдёт без перезагрузки списка
+    if (res && res.version) item.changedAt = res.version;
+    state.pending--;
+    resolveSaved(true);
+    if (!state.pending) await loadItems({ silent: true });
+  } catch (e) {
+    state.pending--;
+    resolveSaved(false);
+    Object.keys(item).forEach((k) => { delete item[k]; });
+    Object.assign(item, before);
+    saveCache();
+    refreshCurrentView();
+    handleWriteError(e);
+  }
+}
+
+/** Выбрать «Кто платил» прямо из карточки. */
+function pickBuyer(item) {
+  openPicker('Кто платил за «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), (name) => {
+    const version = item.changedAt;
+    optimistic(item, { buyer: name }, () => api('update', { id: item.id, version, buyer: name }), `Кто платил: ${name}`);
+  });
+}
 
 async function discount10() {
   const item = state.current;
   const next = discounted(item.planPrice);
   const margin = isNum(item.buyPrice) ? ` Наценка станет ${signedRub(next - item.buyPrice)}.` : '';
   if (!(await ask(`Снизить плановую цену с ${rub(item.planPrice)} до ${rub(next)}?${margin}`))) return;
-  try {
-    await api('update', { id: item.id, version: item.changedAt, planPrice: next });
-    haptic('success');
-    toast(`Новая цена: ${rub(next)}`);
-    await loadItems({ silent: true });
-  } catch (e) { handleWriteError(e); }
+  const version = item.changedAt;
+  optimistic(item, { planPrice: next }, () => api('update', { id: item.id, version, planPrice: next }), `Новая цена: ${rub(next)}`);
 }
 
 async function changeStatus(status) {
   const item = state.current;
   if (item.status === STATUS.sold && !(await ask('Вернуть вещь в наличие? Цена и дата продажи сотрутся.'))) return;
-  try {
-    await api('setStatus', { id: item.id, status, version: item.changedAt });
-    haptic('success');
-    toast(item.status === STATUS.inTransit && status === STATUS.inStock ? 'Получена — теперь в наличии ✓' : `Статус: ${status}`);
-    await loadItems({ silent: true });
-  } catch (e) { handleWriteError(e); }
+  const version = item.changedAt;
+  const msg = item.status === STATUS.inTransit && status === STATUS.inStock ? 'Получена — теперь в наличии ✓' : `Статус: ${status}`;
+  optimistic(item, { status, salePrice: null, saleDate: '', soldBy: '' },
+    () => api('setStatus', { id: item.id, status, version }), msg, item.status);
+}
+
+/** Скопировать текст и в Telegram предложить переслать его в любой чат. */
+async function shareText(text, title) {
+  const ok = await copyText(text);
+  if (tg && tg.initData && tg.showPopup && tg.openTelegramLink) {
+    try {
+      tg.showPopup({
+        title: ok ? 'Текст скопирован' : title,
+        message: text.slice(0, 250),
+        buttons: [{ id: 'share', type: 'default', text: 'Переслать в чат' }, { type: 'close' }],
+      }, (id) => {
+        if (id === 'share') tg.openTelegramLink('https://t.me/share/url?url=%20&text=' + encodeURIComponent(text));
+      });
+      return;
+    } catch (e) { /* старый Telegram — просто уведомление ниже */ }
+  }
+  toast(ok ? `${title}: скопировано` : 'Не удалось скопировать');
+}
+
+/** Текст отчёта за текущий месяц — для партнёра. */
+function reportText() {
+  const now = new Date();
+  const sold = monthSales(0);
+  const revenue = sold.reduce((s, i) => s + (i.salePrice || 0), 0);
+  const profit = sold.reduce((s, i) => s + (profitOf(i) || 0), 0);
+  const unsold = state.items.filter((i) => i.status !== STATUS.sold);
+  const transit = unsold.filter((i) => i.status === STATUS.inTransit).length;
+  const invested = unsold.reduce((s, i) => s + (i.buyPrice || 0), 0);
+  const lines = [`📊 Учёт вещей — ${MONTHS_FULL[now.getMonth()].toLowerCase()} ${now.getFullYear()}`, ''];
+  lines.push(`Продано: ${pieces(sold.length)} на ${rub(revenue)}, прибыль ${signedRub(profit)}`);
+  sold.slice(0, 10).forEach((i) => lines.push(`• ${i.title} — ${rub(i.salePrice)}${profitOf(i) !== null ? ' (' + signedRub(profitOf(i)) + ')' : ''}`));
+  if (sold.length > 10) lines.push(`• …и ещё ${sold.length - 10}`);
+  lines.push('', `Не продано: ${pieces(unsold.length)}${transit ? ` (в пути ${transit})` : ''}, вложено ${rub(invested)}`);
+  const totals = [...partnerTotals('month').values()].filter((t) => t.name && (t.buy || t.sale));
+  if (totals.length) {
+    lines.push('', 'По партнёрам за месяц:');
+    totals.forEach((t) => lines.push(`• ${t.name}: закупил ${rub(t.buy)}, продал ${rub(t.sale)}`));
+  }
+  return lines.join('\n');
 }
 
 function adText(item) {
@@ -736,12 +1510,52 @@ function adText(item) {
 
 // ---------------------------------------------------------------- продажа
 
+/** Плавно закрыть шторку «Продано» (уезжает вниз). */
+function closeSheet() {
+  const sheet = $('#sell-sheet');
+  if (sheet.hidden || sheet.classList.contains('closing')) return;
+  const body = sheet.querySelector('.sheet-body');
+  body.style.transform = '';
+  sheet.classList.add('closing');
+  setTimeout(() => { sheet.hidden = true; sheet.classList.remove('closing'); }, 200);
+}
+
+/** Шторку можно смахнуть вниз за ручку или заголовок. */
+function bindSheetDrag() {
+  const sheet = $('#sell-sheet');
+  const body = sheet.querySelector('.sheet-body');
+  const grip = sheet.querySelector('.sheet-grip');
+  let sy = 0, dy = 0, drag = false;
+  const start = (e) => { drag = true; sy = e.clientY; dy = 0; body.style.transition = 'none'; try { e.target.setPointerCapture(e.pointerId); } catch (err) { /* синтетика */ } };
+  const move = (e) => { if (!drag) return; dy = Math.max(0, e.clientY - sy); body.style.transform = `translate3d(0, ${dy}px, 0)`; };
+  const end = () => {
+    if (!drag) return;
+    drag = false;
+    body.style.transition = '';
+    if (dy > 90) closeSheet(); else body.style.transform = '';
+  };
+  [grip, $('#sell-h')].forEach((h) => {
+    h.addEventListener('pointerdown', start);
+    h.addEventListener('pointermove', move);
+    h.addEventListener('pointerup', end);
+    h.addEventListener('pointercancel', end);
+  });
+}
+
 function openSell() {
   const f = $('#sell-form');
   f.reset();
   f.salePrice.value = isNum(state.current.planPrice) ? state.current.planPrice : '';
   f.saleDate.value = todayIso();
   fillPartnerSelect(f.soldBy, myName());
+  // Быстрые цены: по плану, −5%, −10% (округление до сотни)
+  const plan = state.current.planPrice;
+  const quick = $('#sell-quick');
+  quick.replaceChildren(...(isNum(plan) && plan > 0 ? [['по плану', plan], ['−5%', Math.round(plan * 0.95 / 100) * 100], ['−10%', Math.round(plan * 0.9 / 100) * 100]] : [])
+    .map(([label, value]) => el('button', {
+      type: 'button', class: 'quick-price',
+      onclick: () => { f.salePrice.value = value; updateSellProfit(); haptic('tap'); },
+    }, el('b', {}, label), ' ', nf.format(value))));
   $('#sell-title').textContent = state.current.title;
   $('#sell-error').textContent = '';
   updateSellProfit();
@@ -772,24 +1586,18 @@ function updateSellProfit() {
 async function submitSell(e) {
   e.preventDefault();
   const f = e.target;
-  const btn = f.querySelector('button[type=submit]');
   if (f.salePrice.value === '' || Number(f.salePrice.value) < 0) {
     $('#sell-error').textContent = 'Укажите цену продажи.'; f.salePrice.focus(); return;
   }
-  btn.disabled = true;
-  try {
-    const item = state.current;
-    await api('sell', {
-      id: item.id, salePrice: Number(f.salePrice.value), saleDate: f.saleDate.value,
-      soldBy: f.soldBy.value, version: item.changedAt,
-    });
-    haptic('success');
-    $('#sell-sheet').hidden = true;
-    toast('Продано ✓');
-    await loadItems({ silent: true });
-  } catch (err) {
-    handleWriteError(err, $('#sell-error'));
-  } finally { btn.disabled = false; }
+  const item = state.current;
+  const payload = {
+    id: item.id, salePrice: Number(f.salePrice.value), saleDate: f.saleDate.value || todayIso(),
+    soldBy: f.soldBy.value || myName(), version: item.changedAt,
+  };
+  closeSheet();
+  optimistic(item, {
+    status: STATUS.sold, salePrice: payload.salePrice, saleDate: isoToRu(payload.saleDate), soldBy: payload.soldBy,
+  }, () => api('sell', payload), 'Продано ✓', item.status);
 }
 
 // ---------------------------------------------------------------- форма (добавить / изменить)
@@ -802,23 +1610,31 @@ const CLONE_FIELDS = ['title', 'category', 'brand', 'condition', 'country', 'sou
 const BUY_ONLY_FIELDS = ['buyPrice', 'buyer', 'seller'];
 
 const myName = () => (state.user && state.user.name) || '';
-/** Партнёры для выпадающих списков: я первым, затем остальные. */
+/** Общие деньги (касса) — третий «кошелёк» наряду с личными деньгами партнёров. */
+const COMMON = 'Общие';
+const walletLabel = (n) => (n === COMMON ? 'Общие (касса)' : n);
+/** Партнёры (люди): я первым, затем остальные. «Общие» сюда не входят. */
 function partnerList() {
-  const all = [myName(), ...state.partners].filter(Boolean);
+  const all = [myName(), ...state.partners].filter((n) => n && n !== COMMON);
   return all.filter((n, i) => all.indexOf(n) === i);
 }
+/** Варианты для «Кто платил» / «Деньги получил»: касса и партнёры. */
+function walletList() {
+  return [COMMON, ...partnerList()];
+}
 function fillPartnerSelect(sel, value) {
-  sel.replaceChildren(el('option', { value: '' }, '— не указано'), ...partnerList().map((n) => el('option', { value: n }, n)));
+  sel.replaceChildren(el('option', { value: '' }, '— не указано'), ...walletList().map((n) => el('option', { value: n }, walletLabel(n))));
   setField(sel.form, sel.name, value);
 }
 
 function fillSelects() {
   document.querySelectorAll('select[data-list]').forEach((sel) => {
-    const values = sel.dataset.list === 'partners' ? partnerList() : (state.lists[sel.dataset.list] || []);
+    const partners = sel.dataset.list === 'partners';
+    const values = partners ? walletList() : (state.lists[sel.dataset.list] || []);
     const keep = sel.value;
     sel.replaceChildren(
-      el('option', { value: '' }, sel.dataset.list === 'partners' ? '— не указано' : '—'),
-      ...values.map((v) => el('option', { value: v }, v)),
+      el('option', { value: '' }, partners ? '— не указано' : '—'),
+      ...values.map((v) => el('option', { value: v }, partners ? walletLabel(v) : v)),
     );
     sel.value = keep;
   });
@@ -926,7 +1742,8 @@ function syncFormExtras() {
   } else hint.textContent = '';
 }
 
-function onFormInput() {
+function onFormInput(e) {
+  if (e && e.target && e.target.classList) e.target.classList.remove('invalid');
   state.form.dirty = true;
   setClosingGuard(true);
   syncFormExtras();
@@ -1011,18 +1828,29 @@ async function submitForm(e) {
   const err = $('#form-error');
   const data = collectForm();
   err.textContent = '';
-  if (!data.title) { err.textContent = 'Укажите название.'; f.title.focus(); return; }
-  if (data.status === STATUS.sold && data.salePrice === '') { err.textContent = 'Укажите цену продажи.'; f.salePrice.focus(); return; }
+  f.querySelectorAll('.invalid').forEach((n) => n.classList.remove('invalid'));
+  // Ошибка: подсветить поле, прокрутить к нему, сообщение у кнопки
+  const bad = (name, message) => {
+    const input = f.elements[name];
+    err.textContent = message;
+    input.classList.add('invalid');
+    input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setTimeout(() => input.focus({ preventScroll: true }), 250);
+    haptic('error');
+  };
+  if (!data.title) { bad('title', 'Укажите название.'); return; }
+  if (data.status === STATUS.sold && data.salePrice === '') { bad('salePrice', 'Укажите цену продажи.'); return; }
   for (const k of ['buyPrice', 'planPrice', 'salePrice']) {
-    if (data[k] !== undefined && data[k] !== '' && !(Number(data[k]) >= 0)) { err.textContent = 'Проверьте цены.'; f.elements[k].focus(); return; }
+    if (data[k] !== undefined && data[k] !== '' && !(Number(data[k]) >= 0)) { bad(k, 'Проверьте цену — нужно число не меньше 0.'); return; }
   }
   if (data.commissionPct !== '' && !(Number(data.commissionPct) >= 0 && Number(data.commissionPct) <= 100)) {
-    err.textContent = 'Комиссия — число от 0 до 100 %.'; f.commissionPct.focus(); return;
+    bad('commissionPct', 'Комиссия — число от 0 до 100 %.'); return;
   }
 
   const btn = $('#form-submit');
   btn.disabled = true;
   btn.textContent = state.form.photo ? 'Загружаю фото…' : 'Сохраняю…';
+  mainButtonBusy(true);
   const photo = state.form.photo ? { mime: state.form.photo.mime, base64: state.form.photo.base64 } : undefined;
   try {
     if (state.form.mode === 'edit') {
@@ -1033,7 +1861,7 @@ async function submitForm(e) {
       state.form.dirty = false;
       haptic('success');
       toast('Сохранено ✓');
-      await loadItems({ silent: true });
+      await loadItems({ silent: true, force: true }); // force: показать сохранённое, даже если рядом ждёт удаление
       openItem(item.id, { push: false });
       state.stack = ['list'];
     } else {
@@ -1047,13 +1875,14 @@ async function submitForm(e) {
       state.query = '';
       $('#search').value = '';
       show('list');
-      await loadItems({ silent: true });
+      await loadItems({ silent: true, force: true }); // force: новая вещь видна сразу
     }
   } catch (ex) {
     handleWriteError(ex, err);
   } finally {
     btn.disabled = false;
     btn.textContent = 'Сохранить';
+    mainButtonBusy(false);
   }
 }
 
@@ -1066,11 +1895,27 @@ function deleteCurrent() {
 const MONTHS = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
 const MONTHS_FULL = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
-function tile(label, value, sub, cls) {
-  return el('div', { class: 'tile' },
-    el('div', { class: 'tile-label' }, label),
+/** Плитка статистики. tab — если задан, нажатие открывает список с этой вкладкой. */
+function tile(label, value, sub, cls, tab) {
+  const children = [
+    el('div', { class: 'tile-label' }, label, tab ? el('span', { class: 'tile-go', 'aria-hidden': 'true' }, '›') : null),
     el('div', { class: 'tile-value ' + (cls || '') }, value),
-    sub ? el('div', { class: 'tile-sub' }, sub) : null);
+    sub ? el('div', { class: 'tile-sub' }, sub) : null,
+  ];
+  if (!tab) return el('div', { class: 'tile' }, ...children);
+  return el('button', { type: 'button', class: 'tile tile-link', onclick: () => openListTab(tab) }, ...children);
+}
+
+/** Из статистики — в список нужной вкладки (сбросив фильтры). */
+function openListTab(tab) {
+  state.tab = tab;
+  state.category = '';
+  state.query = '';
+  $('#search').value = '';
+  $('#search-clear').hidden = true;
+  haptic('tap');
+  show('list');
+  renderList();
 }
 
 function median(arr) {
@@ -1082,15 +1927,54 @@ function median(arr) {
 
 function openStats(tab) {
   if (typeof tab === 'string') state.statsTab = tab;
+  const again = state.view === 'stats';
   show('stats');
+  if (again) { window.scrollTo(0, 0); animateView($('#view-stats'), 'enter-forward'); }
   renderStats();
 }
 
+// ---------------------------------------------------------------- нижняя панель разделов
+function syncNav() {
+  const active = state.view === 'list' ? 'list' : state.view === 'stats' ? state.statsTab : '';
+  document.querySelectorAll('#bottom-nav [data-nav]').forEach((b) => {
+    if (b.dataset.nav === active) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+}
+
+/** Нажатие на раздел внизу. Повторное нажатие на открытый раздел — наверх. */
+function navTo(target) {
+  haptic('tap');
+  if (target === 'list') {
+    if (state.view === 'list') { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+    state.stack = [];
+    renderList();
+    show('list', { push: false });
+    return;
+  }
+  if (state.view === 'stats' && state.statsTab === target) { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+  state.statsTab = target;
+  // Разделы — верхний уровень: «Назад» из любого ведёт на склад, а не по цепочке разделов
+  if (state.view !== 'stats') { state.stack = []; if (state.view !== 'list') state.view = 'list'; }
+  openStats();
+}
+
+function setLayout(layout) {
+  state.layout = layout === 'list' ? 'list' : 'grid';
+  document.body.classList.toggle('layout-list', state.layout === 'list');
+  storage.set('uv.layout', state.layout);
+}
+
+const STATS_TITLES = { general: 'Статистика', partners: 'Партнёры', journal: 'Журнал' };
 function renderStats() {
   document.querySelectorAll('[data-stats-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.statsTab === state.statsTab)));
+  $('#stats-title').textContent = STATS_TITLES[state.statsTab] || 'Статистика';
   $('#stats-general').hidden = state.statsTab !== 'general';
   $('#stats-partners').hidden = state.statsTab !== 'partners';
-  if (state.statsTab === 'partners') renderPartners(); else renderGeneralStats();
+  $('#stats-journal').hidden = state.statsTab !== 'journal';
+  syncNav();
+  if (state.statsTab === 'partners') renderPartners();
+  else if (state.statsTab === 'journal') loadHistory();
+  else renderGeneralStats();
 }
 
 // ---------------------------------------------------------------- партнёры
@@ -1113,7 +1997,7 @@ function partnerTotals(period) {
     if (!t.has(name)) t.set(name, { name, buy: 0, buyCount: 0, sale: 0, saleCount: 0 });
     return t.get(name);
   };
-  partnerList().forEach(get);
+  walletList().forEach(get);
   state.items.forEach((i) => {
     if (isNum(i.buyPrice) && i.buyPrice > 0 && inPeriod(i.buyDate, period)) {
       const r = get(i.buyer || '');
@@ -1147,6 +2031,9 @@ function settlement() {
     if (i.status === STATUS.sold && isNum(i.salePrice)) { if (i.soldBy) add(i.soldBy, i.salePrice); else skipped++; }
   });
   partnerList().forEach((n) => { if (!net.has(n)) net.set(n, 0); });
+  // Касса общая (поровну) — на перевод между партнёрами не влияет, показываем отдельно
+  const common = net.get(COMMON) || 0;
+  net.delete(COMMON);
   const names = [...net.keys()];
   const total = names.reduce((s, n) => s + net.get(n), 0);
   const share = names.length ? total / names.length : 0;
@@ -1161,7 +2048,7 @@ function settlement() {
       if (amount > 0) { transfers.push({ from: p.name, to: t.name, amount }); p.owe -= amount; t.owe += amount; }
     }
   }
-  return { names, total, share, transfers, skipped };
+  return { names, total, share, transfers, skipped, common };
 }
 
 function renderPartners() {
@@ -1176,16 +2063,18 @@ function renderPartners() {
   const cards = [...totals.values()];
   const box = $('#partner-cards');
   box.classList.toggle('single', cards.length < 2);
+  box.classList.toggle('three', cards.length === 3);
   box.replaceChildren(...cards.map((c) => {
     const diff = c.sale - c.buy;
-    return el('div', { class: 'partner-card' + (c.name === myName() ? ' me' : '') },
-      el('div', { class: 'partner-name' }, c.name, c.name === myName() ? el('span', { class: 'badge info' }, 'вы') : null),
-      el('div', { class: 'partner-row' }, el('span', {}, 'Закупил'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
-      el('div', { class: 'partner-row' }, el('span', {}, 'Продал'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
-      el('div', { class: 'partner-row total' }, el('span', {}, 'Разница'),
+    const isCommon = c.name === COMMON;
+    return el('div', { class: 'partner-card' + (c.name === myName() ? ' me' : '') + (isCommon ? ' common' : '') },
+      el('div', { class: 'partner-name' }, isCommon ? '🏦 Общая касса' : c.name, c.name === myName() ? el('span', { class: 'badge info' }, 'вы') : null),
+      el('div', { class: 'partner-row' }, el('span', {}, isCommon ? 'Потрачено' : 'Закупил'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
+      el('div', { class: 'partner-row' }, el('span', {}, isCommon ? 'Пришло' : 'Продал'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
+      el('div', { class: 'partner-row total' }, el('span', {}, isCommon ? 'В кассе' : 'Разница'),
         el('b', { class: diff < 0 ? 'profit-minus' : diff > 0 ? 'profit-plus' : '' }, signedRub(diff))));
   }));
-  if (cards.length < 2) {
+  if (cards.filter((c) => c.name !== COMMON).length < 2) {
     box.append(el('p', { class: 'muted' }, 'Второй партнёр появится здесь, когда его Telegram ID будет в ALLOWED_IDS и он откроет бота, '
       + 'или когда его имя будет указано в «Кто платил» / «Деньги получил».'));
   }
@@ -1197,10 +2086,13 @@ function renderPartners() {
   if (missing.length) {
     const sums = unknown ? `За период: закупки ${rub(unknown.buy)}, продажи ${rub(unknown.sale)}. ` : '';
     const list = el('ul', { class: 'items', hidden: true }, missing.slice(0, 30).map((i) => itemRow(i)));
+    const noBuyer = missing.filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer).map((i) => i.id);
     unk.replaceChildren(el('div', { class: 'notice' },
       el('b', {}, `Не указан партнёр: ${pieces(missing.length)}`),
-      el('p', {}, `${sums}Откройте вещь → «Изменить» → «Кто платил» / «Деньги получил».`),
-      el('button', { type: 'button', class: 'link-btn', onclick: (e) => { list.hidden = !list.hidden; e.target.textContent = list.hidden ? 'Показать вещи' : 'Скрыть'; } }, 'Показать вещи'),
+      el('p', {}, `${sums}Можно указать «Кто платил» сразу всем — или по одной: вещь → «Изменить».`),
+      el('div', { class: 'notice-actions' },
+        noBuyer.length ? el('button', { type: 'button', class: 'primary', onclick: () => bulkFillBuyer(noBuyer) }, `Указать разом (${noBuyer.length})`) : null,
+        el('button', { type: 'button', class: 'link-btn', onclick: (e) => { list.hidden = !list.hidden; e.target.textContent = list.hidden ? 'Показать вещи' : 'Скрыть'; } }, 'Показать вещи')),
       list));
   } else unk.replaceChildren();
 
@@ -1216,8 +2108,44 @@ function renderPartners() {
       : [el('div', { class: 'settle-transfer' }, el('b', {}, 'Вы в расчёте ✓'))];
     settle.replaceChildren(el('div', { class: 'settle-card' },
       ...head,
-      el('p', { class: 'muted' }, `Общий результат (продажи − закупки): ${signedRub(s.total)}, доля каждого ${signedRub(Math.round(s.share))}.`
+      el('p', { class: 'muted' }, `Личные деньги (продажи − закупки): ${signedRub(s.total)}, доля каждого ${signedRub(Math.round(s.share))}. `
+        + `В общей кассе за всё время: ${signedRub(s.common)} — она общая, делится поровну.`
         + (s.skipped ? ` Без партнёра не учтено записей: ${s.skipped}.` : ''))));
+  }
+}
+
+/** «5 мин назад» из «10.11.2026 14:05:00». */
+function timeAgo(at) {
+  const m = /^(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2})/.exec(at || '');
+  if (!m) return at || '';
+  const d = new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5]);
+  const min = Math.round((Date.now() - d) / 60000);
+  if (min < 1) return 'только что';
+  if (min < 60) return `${min} мин назад`;
+  const hrs = Math.round(min / 60);
+  if (hrs < 24) return `${hrs} ч назад`;
+  if (hrs < 48) return 'вчера';
+  return `${m[1]}.${m[2]}`;
+}
+
+/** Последние изменения из листа «Журнал» — грузим при открытии статистики. */
+async function loadHistory() {
+  const box = $('#stats-history');
+  if (!box.querySelector('.history-row')) {
+    box.replaceChildren(...[0, 1, 2, 3, 4].map(() => el('li', { class: 'history-skel' })));
+  }
+  try {
+    const rows = await api('history');
+    if (!rows.length) { box.replaceChildren(el('li', { class: 'muted' }, 'Пока пусто — здесь появятся действия из приложения.')); return; }
+    box.replaceChildren(...rows.slice(0, 50).map((r) => {
+      const exists = r.id && state.items.some((i) => i.id === r.id);
+      return el('li', {
+        class: 'history-row' + (exists ? ' link' : ''),
+        onclick: exists ? () => { state.navIds = []; openItem(r.id); } : null,
+      }, el('div', { class: 'history-text' }, r.text), el('div', { class: 'history-when' }, timeAgo(r.at)));
+    }));
+  } catch (e) {
+    box.replaceChildren(el('li', { class: 'muted' }, 'Не удалось загрузить: ' + e.message));
   }
 }
 
@@ -1240,11 +2168,11 @@ function renderGeneralStats() {
 
   $('#stats-tiles').replaceChildren(
     tile('Не продано', pieces(onHand.length), `вложено ${rub(stockCost)}`
-      + (onHand.some((i) => i.status === STATUS.inTransit) ? `, в пути ${onHand.filter((i) => i.status === STATUS.inTransit).length}` : '')),
-    tile('План продаж', rub(planSum), `наценка ${signedRub(potential)}`),
-    tile('Продано за месяц', pieces(thisM.length), `выручка ${rub(thisM.reduce((s, i) => s + (i.salePrice || 0), 0))}`),
+      + (onHand.some((i) => i.status === STATUS.inTransit) ? `, в пути ${onHand.filter((i) => i.status === STATUS.inTransit).length}` : ''), '', 'Все'),
+    tile('План продаж', rub(planSum), `наценка ${signedRub(potential)}`, '', STATUS.inStock),
+    tile('Продано за месяц', pieces(thisM.length), `выручка ${rub(thisM.reduce((s, i) => s + (i.salePrice || 0), 0))}`, '', STATUS.sold),
     tile('Прибыль за месяц', signedRub(profitThis), prevM.length || profitPrev ? `${delta >= 0 ? '▲' : '▼'} ${signedRub(delta)} к прошлому` : 'прошлый месяц — нет продаж',
-      profitThis < 0 ? 'profit-minus' : ''),
+      profitThis < 0 ? 'profit-minus' : '', STATUS.sold),
     tile('Срок продажи', sellDays.length ? days(median(sellDays)) : '—', sellDays.length ? 'медиана от закупа' : 'нет данных'),
     tile('Средняя наценка', avgMarkup === null ? '—' : `${avgMarkup}%`, `прибыль всего ${signedRub(totalProfit)}`),
   );
@@ -1341,6 +2269,7 @@ function renderChart(months) {
         : `M${x},${y0}V${y1 - rr}Q${x},${y1} ${x + rr},${y1}H${x + bw - rr}Q${x + bw},${y1} ${x + bw},${y1 - rr}V${y0}Z`;
     }
     const bar = svg('path', { class: 'bar' + (m.profit < 0 ? ' neg' : ''), d });
+    bar.style.animationDelay = `${i * 45}ms`; // столбики вырастают по очереди
     bars.push(bar);
     const showTip = () => {
       bars.forEach((b) => b.classList.remove('active'));
@@ -1406,7 +2335,22 @@ function demoPhoto(item) {
   return { mime: 'image/jpeg', base64: c.toDataURL('image/jpeg', 0.8).split(',')[1] };
 }
 
+const demoLog = [];
+function demoRecord(text, id) {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  demoLog.push({ at: `${pad(now.getDate())}.${pad(now.getMonth() + 1)}.${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`, who: 'Антон', text, id: id || '' });
+}
+
 async function demoApi(action, p) {
+  if (['add', 'update', 'sell', 'setStatus', 'delete', 'bulkUpdate', 'bulkDelete'].includes(action)) {
+    const it = p.id && demoDb.items.find((i) => i.id === p.id);
+    const title = it ? it.title : (p.title || '');
+    const texts = { add: '🆕 Антон добавил(а) «' + title + '»', update: '✏️ Антон изменил(а) «' + title + '»', sell: '💰 Антон продал(а) «' + title + '»',
+      setStatus: '🔁 Антон: «' + title + '» → ' + p.status, delete: '🗑 Антон удалил(а) «' + title + '»',
+      bulkUpdate: '✏️ Антон изменил(а) ' + (p.ids || []).length + ' шт.', bulkDelete: '🗑 Антон удалил(а) ' + (p.ids || []).length + ' шт.' };
+    demoRecord(texts[action], p.id);
+  }
   await new Promise((r) => setTimeout(r, 200));
   const find = (id) => {
     const it = demoDb.items.find((i) => i.id === id);
@@ -1419,6 +2363,15 @@ async function demoApi(action, p) {
   switch (action) {
     case 'meta': return { user: { id: 0, name: 'Антон' }, partners: ['Антон', 'Дима'], lists: { ...DEFAULT_LISTS, category: ['Куртки', 'Худи', 'Обувь', 'Сумки', 'Аксессуары', 'Футболки'] } };
     case 'list': return JSON.parse(JSON.stringify(demoDb.items));
+    case 'history': return demoLog.slice().reverse().slice(0, 50);
+    case 'photos': {
+      const out = {};
+      p.ids.forEach((id) => {
+        const it = demoDb.items.find((i) => i.id === id);
+        out[id] = it && it.hasPhoto ? (demoDb.photos.get(id) || demoPhoto(it)) : null;
+      });
+      return out;
+    }
     case 'photo': {
       const it = demoDb.items.find((i) => i.id === p.id);
       if (!it || !it.hasPhoto) return null;
@@ -1447,10 +2400,26 @@ async function demoApi(action, p) {
       Object.assign(it, patch);
       if (it.status !== STATUS.sold) { it.salePrice = null; it.saleDate = ''; it.soldBy = ''; }
       touch(it);
-      return { id: p.id };
+      return { id: p.id, version: it.changedAt };
     }
-    case 'sell': { const it = find(p.id); Object.assign(it, { status: STATUS.sold, salePrice: p.salePrice, saleDate: isoToRu(p.saleDate), soldBy: p.soldBy || 'Антон' }); touch(it); return { id: p.id }; }
-    case 'setStatus': { const it = find(p.id); Object.assign(it, { status: p.status, salePrice: null, saleDate: '', soldBy: '' }); touch(it); return { id: p.id }; }
+    case 'sell': { const it = find(p.id); Object.assign(it, { status: STATUS.sold, salePrice: p.salePrice, saleDate: isoToRu(p.saleDate), soldBy: p.soldBy || 'Антон' }); touch(it); return { id: p.id, version: it.changedAt }; }
+    case 'setStatus': { const it = find(p.id); Object.assign(it, { status: p.status, salePrice: null, saleDate: '', soldBy: '' }); touch(it); return { id: p.id, version: it.changedAt }; }
+    case 'bulkUpdate': {
+      let updated = 0;
+      demoDb.items.forEach((it) => {
+        if (!p.ids.includes(it.id)) return;
+        if ('status' in p.patch && it.status === STATUS.sold) return;
+        Object.assign(it, p.patch);
+        if ('status' in p.patch) Object.assign(it, { salePrice: null, saleDate: '', soldBy: '' });
+        touch(it); updated++;
+      });
+      return { updated };
+    }
+    case 'bulkDelete': {
+      const before = demoDb.items.length;
+      demoDb.items = demoDb.items.filter((i) => !p.ids.includes(i.id));
+      return { removed: before - demoDb.items.length };
+    }
     case 'delete': { find(p.id); demoDb.items = demoDb.items.filter((i) => i.id !== p.id); return { id: p.id }; }
     default: throw new Error('Неизвестное действие');
   }
@@ -1459,45 +2428,61 @@ async function demoApi(action, p) {
 // ---------------------------------------------------------------- запуск
 
 function bindEvents() {
+  const syncOnline = () => { $('#offline').hidden = navigator.onLine !== false; };
+  window.addEventListener('online', () => { syncOnline(); loadItems({ silent: true }).catch(() => {}); });
+  window.addEventListener('offline', syncOnline);
+  syncOnline();
+  window.addEventListener('pagehide', flushPendingDeletes);
+  enablePullToRefresh();
   let searchTimer;
+  $('#search-clear').addEventListener('click', () => {
+    const s = $('#search');
+    s.value = '';
+    s.dispatchEvent(new Event('input'));
+    s.focus();
+  });
+  $('#search').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
   $('#search').addEventListener('input', (e) => {
+    $('#search-clear').hidden = !e.target.value;
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => { state.query = e.target.value; renderList(); }, 120);
   });
   $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; storage.set('uv.sort', state.sort); renderList(); });
   $('#btn-add').addEventListener('click', () => openForm('add'));
   $('#btn-refresh').addEventListener('click', () => loadItems().then(() => toast('Обновлено')).catch((e) => toast(e.message)));
-  $('#btn-stats').addEventListener('click', openStats);
+  document.querySelectorAll('#bottom-nav [data-nav]').forEach((b) => b.addEventListener('click', () => navTo(b.dataset.nav)));
+  $('#btn-layout').addEventListener('click', () => {
+    setLayout(state.layout === 'grid' ? 'list' : 'grid');
+    haptic('tap');
+    renderList();
+    slideList(1);
+  });
   document.querySelectorAll('[data-stats-tab]').forEach((b) => b.addEventListener('click', () => {
     state.statsTab = b.dataset.statsTab;
     haptic('tap');
     renderStats();
   }));
-  $('#summary').addEventListener('click', openStats);
   document.querySelectorAll('[data-back]').forEach((b) => b.addEventListener('click', goBack));
 
-  $('#item-photo').addEventListener('click', openLightbox);
-  $('#lightbox').addEventListener('click', () => { $('#lightbox').hidden = true; });
+  $('#item-photo').addEventListener('click', () => { if (!$('#item-photo-wrap').dataset.swiped) openLightbox(); });
+  bindPhotoSwipe();
+  bindLightbox();
+  bindTabSwipe();
+  window.addEventListener('resize', () => positionIndicator(tabIndex(state.tab), false));
+  // Ширина вкладок изменилась (поворот, шрифт, полоса прокрутки) — ползунок следом, без анимации
+  if ('ResizeObserver' in window) new ResizeObserver(() => { if (!state.tabSwiping) positionIndicator(tabIndex(state.tab), false); }).observe($('#status-tabs'));
+  $('#select-cancel').addEventListener('click', exitSelect);
+  $('#select-all').addEventListener('click', selectAllVisible);
+  document.querySelectorAll('[data-bulk]').forEach((b) => b.addEventListener('click', () => {
+    if (b.dataset.bulk === 'delete') bulkDelete(); else bulkPick(b.dataset.bulk);
+  }));
+  $('#picker-sheet').addEventListener('click', (e) => {
+    if (e.target.id === 'picker-sheet' || e.target.id === 'picker-cancel') $('#picker-sheet').hidden = true;
+  });
   $('#btn-edit').addEventListener('click', () => openForm('edit'));
   $('#btn-clone').addEventListener('click', () => openForm('add', state.current));
-  $('#btn-copy-ad').addEventListener('click', async () => {
-    const text = adText(state.current);
-    const ok = await copyText(text);
-    // В Telegram — предлагаем сразу переслать текст в любой чат.
-    if (tg && tg.initData && tg.showPopup && tg.openTelegramLink) {
-      try {
-        tg.showPopup({
-          title: ok ? 'Текст скопирован' : 'Текст объявления',
-          message: text.slice(0, 250),
-          buttons: [{ id: 'share', type: 'default', text: 'Переслать в чат' }, { type: 'close' }],
-        }, (id) => {
-          if (id === 'share') tg.openTelegramLink('https://t.me/share/url?url=%20&text=' + encodeURIComponent(text));
-        });
-        return;
-      } catch (e) { /* старый Telegram — просто уведомление ниже */ }
-    }
-    toast(ok ? 'Текст объявления скопирован' : 'Не удалось скопировать');
-  });
+  $('#btn-copy-ad').addEventListener('click', () => shareText(adText(state.current), 'Текст объявления'));
+  $('#btn-share-report').addEventListener('click', () => shareText(reportText(), 'Отчёт за месяц'));
 
   const f = $('#item-form');
   f.addEventListener('submit', submitForm);
@@ -1507,16 +2492,22 @@ function bindEvents() {
   $('#photo-remove').addEventListener('click', onPhotoRemove);
   $('#btn-delete').addEventListener('click', deleteCurrent);
   $('#btn-delete-item').addEventListener('click', deleteCurrent);
-  // Нажатие мимо открытой строки закрывает свайп
-  document.addEventListener('pointerdown', (e) => { if (openSwipeRow && !openSwipeRow.contains(e.target)) closeSwipe(openSwipeRow); });
 
   $('#sell-form').addEventListener('submit', submitSell);
   $('#sell-form').salePrice.addEventListener('input', updateSellProfit);
-  $('#sell-cancel').addEventListener('click', () => { $('#sell-sheet').hidden = true; });
-  $('#sell-sheet').addEventListener('click', (e) => { if (e.target.id === 'sell-sheet') e.target.hidden = true; });
+  $('#sell-cancel').addEventListener('click', () => { closeSheet(); });
+  $('#sell-sheet').addEventListener('click', (e) => { if (e.target.id === 'sell-sheet') closeSheet(); });
+  bindSheetDrag();
 
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') goBack(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') goBack();
+    if (state.view === 'item' && $('#lightbox').hidden && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) {
+      if (e.key === 'ArrowRight') navItem(1);
+      if (e.key === 'ArrowLeft') navItem(-1);
+    }
+  });
   document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushPendingDeletes();
     if (document.visibilityState === 'visible' && Date.now() - state.lastLoad > AUTO_REFRESH_MS && state.view !== 'form') {
       loadItems({ silent: true }).catch(() => {});
     }
@@ -1542,13 +2533,22 @@ async function init() {
     tg.onEvent && tg.onEvent('themeChanged', () => document.documentElement.classList.toggle('tg-dark', tg.colorScheme === 'dark'));
     tg.ready();
     tg.expand();
+    // Шапка и фон Telegram — в цвет приложения, без видимой границы
+    try {
+      if (tg.setHeaderColor) tg.setHeaderColor('bg_color');
+      if (tg.setBackgroundColor) tg.setBackgroundColor('bg_color');
+    } catch (e) { /* старый Telegram */ }
     tg.BackButton.onClick(goBack);
+    try { tg.MainButton.onClick(() => { if (state.view === 'form') $('#item-form').requestSubmit(); }); } catch (e) { /* нет */ }
+    document.documentElement.classList.add('tg-mainbutton');
     // Чтобы свайпы и прокрутка не сворачивали приложение (Telegram 7.7+)
     try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) { /* старый Telegram */ }
   }
   bindEvents();
   const savedSort = storage.get('uv.sort');
   if (savedSort && SORTS[savedSort]) { state.sort = savedSort; $('#sort').value = savedSort; }
+  setLayout(storage.get('uv.layout') || 'grid');
+  document.body.dataset.view = state.view;
 
   if (!DEMO && !(tg && tg.initData)) {
     renderSummary();
