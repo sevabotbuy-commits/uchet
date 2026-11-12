@@ -10,7 +10,7 @@
   <title>Учёт вещей</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <!-- ?v= — номер версии: меняйте при каждом обновлении, иначе Telegram покажет старые файлы из кеша -->
-  <link rel="stylesheet" href="style.css?v=9">
+  <link rel="stylesheet" href="style.css?v=10">
 </head>
 <body>
   <!-- Заставка с логотипом — пока загружаются данные -->
@@ -203,6 +203,18 @@
       <ul id="stats-history" class="history"><li class="muted">Загрузка…</li></ul>
     </div>
     <div id="stats-partners" hidden>
+      <h3 class="section-title">Деньги</h3>
+      <div id="money-cards" class="money-cards"></div>
+      <div class="money-actions">
+        <button type="button" data-money="in">＋ Пополнить</button>
+        <button type="button" data-money="out">− Вывести</button>
+        <button type="button" data-money="transfer">⇄ Перевод</button>
+      </div>
+      <p id="money-note" class="muted money-note"></p>
+      <p class="muted settle-note">Продажи Арсения идут в общие свободные деньги, продажи Севы — в его. Закупка вычитается из кошелька того, кто платил; «В одежде» — деньги в непроданных вещах.</p>
+      <h3 class="section-title">Операции</h3>
+      <ul id="money-ops" class="history"></ul>
+      <h3 class="section-title">По людям</h3>
       <div id="partner-period" class="chips period-chips"></div>
       <div id="partner-cards" class="partner-cards"></div>
       <div id="partner-unknown"></div>
@@ -235,6 +247,29 @@
     </form>
   </div>
 
+  <!-- Деньги: пополнить / вывести / перевод -->
+  <div id="money-sheet" class="sheet" hidden>
+    <form id="money-form" class="sheet-body" novalidate role="dialog" aria-labelledby="money-title">
+      <div class="sheet-grip" aria-hidden="true"></div>
+      <h3 id="money-title">Пополнить</h3>
+      <input type="hidden" name="kind">
+      <div class="row">
+        <label id="money-wallet-label">Кошелёк<select name="wallet"></select></label>
+        <label id="money-to-label" hidden>Куда<select name="to"></select></label>
+      </div>
+      <label>Сумма, ₽ *<input name="amount" type="number" inputmode="numeric" min="1" step="1" required></label>
+      <div class="row">
+        <label>Дата<input name="date" type="date"></label>
+        <label>Комментарий<input name="note" maxlength="200" autocomplete="off" placeholder="напр. стартовые"></label>
+      </div>
+      <p id="money-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button type="button" id="money-cancel">Отмена</button>
+        <button type="submit" class="primary">Записать</button>
+      </div>
+    </form>
+  </div>
+
   <!-- Фото на весь экран -->
   <div id="lightbox" class="lightbox" hidden></div>
 
@@ -263,7 +298,7 @@
 
   <div id="toast" class="toast" hidden role="status"></div>
 
-  <script src="config.js?v=9"></script>
-  <script src="app.js?v=9"></script>
+  <script src="config.js?v=10"></script>
+  <script src="app.js?v=10"></script>
 </body>
 </html>

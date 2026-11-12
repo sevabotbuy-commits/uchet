@@ -44,7 +44,8 @@ const state = {
   seq: 0,             // счётчик локальных изменений (для отбрасывания устаревших ответов)
   navIds: [],
   select: null,       // режим выделения: Set выбранных id или null
-  layout: 'grid',     // вид склада: 'grid' — плитка с крупными фото, 'list' — строки
+  layout: 'grid',
+  money: [],          // журнал денег: пополнения, выводы, переводы     // вид склада: 'grid' — плитка с крупными фото, 'list' — строки
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -202,7 +203,7 @@ async function copyText(text) {
 // ---------------------------------------------------------------- сервер
 
 // Чтение можно безопасно повторить, запись — нет (иначе возможен дубль вещи).
-const RETRY_ACTIONS = ['list', 'meta', 'photo', 'photos'];
+const RETRY_ACTIONS = ['list', 'meta', 'photo', 'photos', 'money'];
 const RETRY_CODES = ['network', 'busy', 'server'];
 
 async function api(action, payload) {
@@ -314,6 +315,7 @@ async function goBack() {
   if (!$('#lightbox').hidden) { closeLightbox(); return; }
   if (!$('#sell-sheet').hidden) { closeSheet(); return; }
   if (!$('#picker-sheet').hidden) { $('#picker-sheet').hidden = true; return; }
+  if (!$('#money-sheet').hidden) { $('#money-sheet').hidden = true; return; }
   if (state.select && state.view === 'list') { exitSelect(); return; }
   if (state.view === 'form' && state.form.dirty && state.form.mode === 'edit') {
     if (!(await ask('Выйти без сохранения изменений?'))) return;
@@ -340,7 +342,11 @@ function setLoading(on) {
 
 function saveCache() {
   state.seq++; // любое локальное изменение делает «летящие» ответы сервера устаревшими
-  storage.set(CACHE_KEY, { items: state.items, lists: state.lists, user: state.user, partners: state.partners, at: state.lastLoad });
+  persistCache();
+}
+/** Записать кеш, не помечая данные изменёнными (для фоновых загрузок). */
+function persistCache() {
+  storage.set(CACHE_KEY, { items: state.items, lists: state.lists, user: state.user, partners: state.partners, money: state.money, at: state.lastLoad });
 }
 
 async function loadItems({ silent = false, force = false } = {}) {
@@ -2106,6 +2112,56 @@ function renderStats() {
 
 const PERIODS = [['month', 'Этот месяц'], ['prev', 'Прошлый месяц'], ['all', 'Всё время']];
 
+// ---------------------------------------------------------------- деньги: свободные и в одежде
+
+/**
+ * В чей кошелёк идут живые деньги человека. Арсений — в общие (его продажи и закупки — общие деньги),
+ * Сева — в свой. Кошельков два: «Общие» и «Сева».
+ */
+const CASH_OF = { 'Арсений': COMMON };
+const cashWallet = (n) => CASH_OF[n] || n;
+function cashWallets() {
+  const all = walletList().map(cashWallet);
+  return all.filter((n, i) => all.indexOf(n) === i);
+}
+const cashLabel = (n) => (n === COMMON ? 'Общие' : n);
+
+async function loadMoney() {
+  try {
+    const rows = await api('money');
+    if (Array.isArray(rows)) { state.money = rows; persistCache(); }
+  } catch (e) { /* без журнала денег — остальное работает */ }
+}
+
+/**
+ * По каждому кошельку: free — свободные деньги (пополнения − выводы ± переводы − закупки + продажи),
+ * clothes — деньги в непроданных вещах (по «Кто платил»).
+ */
+function moneyByWallet() {
+  const w = new Map(cashWallets().map((n) => [n, { name: n, free: 0, clothes: 0, clothesCount: 0, ops: 0, sales: 0, buys: 0 }]));
+  const get = (n) => (n ? w.get(cashWallet(n)) : null);
+  let unknownBuy = 0, unknownBuyCount = 0, unknownSale = 0;
+  state.money.forEach((m) => { const r = get(m.wallet); if (r) { r.free += m.amount; r.ops += m.amount; } });
+  state.items.forEach((i) => {
+    if (!isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0) {
+      const r = get(i.buyer);
+      if (r) {
+        r.free -= i.buyPrice; r.buys += i.buyPrice;
+        if (i.status !== STATUS.sold) { r.clothes += i.buyPrice; r.clothesCount++; }
+      } else { unknownBuy += i.buyPrice; unknownBuyCount++; }
+    }
+    if (i.status === STATUS.sold && isNum(i.salePrice)) {
+      const r = get(i.soldBy);
+      if (!r) { unknownSale++; return; }
+      let cash = i.salePrice;
+      // чужая вещь на комиссии: долю комитента отдали ему — у нас осталась комиссия
+      if (isCommission(i) && !walletList().includes(i.consignor)) cash = commissionFrom(i, i.salePrice) || 0;
+      r.free += cash; r.sales += cash;
+    }
+  });
+  return { wallets: [...w.values()], unknownBuy, unknownBuyCount, unknownSale };
+}
+
 /**
  * Чья вещь: тот, за чьи деньги куплена («Кто платил»). Его затраты — и его прибыль.
  * Комиссионная вещь своего человека (комитент — Арсений/Сева/касса) — его; чужая комиссионная — касса (наша комиссия).
@@ -2181,10 +2237,18 @@ function settlement() {
     const split = saleSplit(i);
     if (!split) return;
     if (!i.soldBy || !split.owner) { skipped++; return; }
-    add(i.soldBy, split.owner, split.owes);
-    if (split.kassa) add(i.soldBy, COMMON, split.kassa);
+    add(cashWallet(i.soldBy), cashWallet(split.owner), split.owes);
+    if (split.kassa) add(cashWallet(i.soldBy), COMMON, split.kassa);
   });
-  const names = walletList();
+  // Переводы между кошельками гасят долг: перевод A → B уменьшает долг A перед B
+  const links = new Map();
+  state.money.forEach((m) => { if (m.link) { if (!links.has(m.link)) links.set(m.link, []); links.get(m.link).push(m); } });
+  links.forEach((pair) => {
+    const from = pair.find((m) => m.amount < 0);
+    const to = pair.find((m) => m.amount > 0);
+    if (from && to) add(cashWallet(to.wallet), cashWallet(from.wallet), to.amount);
+  });
+  const names = cashWallets();
   const transfers = [];
   names.forEach((a, ai) => names.slice(ai + 1).forEach((b) => {
     const net = Math.round((debt.get(a + '→' + b) || 0) - (debt.get(b + '→' + a) || 0));
@@ -2194,7 +2258,100 @@ function settlement() {
   return { names, transfers, skipped };
 }
 
+function renderMoney() {
+  const box = $('#money-cards');
+  if (!box) return;
+  const m = moneyByWallet();
+  box.replaceChildren(...m.wallets.map((w) => el('div', { class: 'money-card' + (w.name === COMMON ? ' common' : '') },
+    el('div', { class: 'money-name' }, w.name === COMMON ? '🏦 Общие' : '👤 ' + w.name),
+    el('div', { class: 'money-free-label' }, 'Свободные'),
+    el('div', { class: 'money-free ' + (w.free < 0 ? 'profit-minus' : '') }, rub(w.free)),
+    el('div', { class: 'money-row' }, el('span', {}, 'В одежде'), el('b', {}, rub(w.clothes)), el('small', {}, pieces(w.clothesCount))),
+    el('div', { class: 'money-row total' }, el('span', {}, 'Всего'), el('b', {}, rub(w.free + w.clothes))))));
+  const notes = [];
+  if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Кто платил» — не вычтены ни из чьих денег.`);
+  if (m.unknownSale) notes.push(`Продаж без «Деньги получил»: ${m.unknownSale} — не учтены.`);
+  if (!state.money.length) notes.push('Внесите стартовые суммы кнопкой «Пополнить» — иначе свободные деньги уйдут в минус на сумму закупок.');
+  $('#money-note').textContent = notes.join(' ');
+  // последние операции
+  const ops = state.money.slice().reverse().filter((op, i, arr) => !op.link || arr.findIndex((o) => o.link === op.link) === i).slice(0, 15);
+  $('#money-ops').replaceChildren(...(ops.length ? ops.map((op) => {
+    const pair = op.link ? state.money.filter((o) => o.link === op.link) : [op];
+    const from = pair.find((o) => o.amount < 0), to = pair.find((o) => o.amount > 0);
+    const text = op.link && from && to
+      ? `🔁 ${cashLabel(from.wallet)} → ${cashLabel(to.wallet)}: ${rub(to.amount)}`
+      : (op.amount >= 0 ? `➕ ${cashLabel(op.wallet)}: +${rub(op.amount)}` : `➖ ${cashLabel(op.wallet)}: −${rub(-op.amount)}`);
+    return el('li', { class: 'history-row money-op' },
+      el('div', { class: 'history-text' }, text, op.note ? el('div', { class: 'muted-small' }, op.note) : null),
+      el('div', { class: 'history-when' }, op.date),
+      el('button', { type: 'button', class: 'op-del', 'aria-label': 'Удалить операцию', onclick: () => deleteMoneyOp(op) }, '×'));
+  }) : [el('li', { class: 'muted' }, 'Операций пока нет.')]));
+}
+
+async function deleteMoneyOp(op) {
+  if (!(await ask(op.link ? 'Удалить перевод целиком (обе стороны)?' : 'Удалить эту операцию?'))) return;
+  const before = state.money;
+  state.money = state.money.filter((o) => o.id !== op.id && !(op.link && o.link === op.link));
+  renderPartners();
+  try {
+    await api('moneyDelete', { id: op.id });
+    toast('Операция удалена');
+    loadMoney().then(() => { if (state.view === 'stats' && state.statsTab === 'partners') renderPartners(); });
+  } catch (e) {
+    state.money = before;
+    renderPartners();
+    toast(e.message);
+  }
+}
+
+/** Шторка операции с деньгами. kind: in | out | transfer; preset — подставить кошельки и сумму (для «Отметить перевод»). */
+function openMoney(kind, preset) {
+  const f = $('#money-form');
+  f.reset();
+  f.kind.value = kind;
+  const fill = (sel, value) => {
+    sel.replaceChildren(...cashWallets().map((n) => el('option', { value: n }, cashLabel(n))));
+    sel.value = value || cashWallets()[0];
+  };
+  fill(f.wallet, preset && preset.from);
+  fill(f.to, (preset && preset.to) || cashWallets().find((n) => n !== f.wallet.value));
+  f.amount.value = preset && preset.amount ? preset.amount : '';
+  f.date.value = todayIso();
+  f.note.value = (preset && preset.note) || '';
+  $('#money-title').textContent = { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
+  $('#money-wallet-label').firstChild.textContent = kind === 'transfer' ? 'Откуда' : 'Кошелёк';
+  $('#money-to-label').hidden = kind !== 'transfer';
+  $('#money-error').textContent = '';
+  $('#money-sheet').hidden = false;
+  haptic('tap');
+  setTimeout(() => f.amount.focus(), 80);
+}
+
+async function submitMoney(e) {
+  e.preventDefault();
+  const f = e.target;
+  const amount = Number(f.amount.value);
+  if (!(amount > 0)) { $('#money-error').textContent = 'Укажите сумму больше нуля.'; f.amount.focus(); return; }
+  if (f.kind.value === 'transfer' && f.to.value === f.wallet.value) { $('#money-error').textContent = 'Выберите разные кошельки.'; return; }
+  const payload = { kind: f.kind.value, wallet: f.wallet.value, to: f.to.value, amount, date: f.date.value || todayIso(), note: f.note.value.trim() };
+  const btn = f.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await api('moneyAdd', payload);
+    $('#money-sheet').hidden = true;
+    haptic('success');
+    toast('Записано ✓');
+    await loadMoney();
+    if (state.view === 'stats' && state.statsTab === 'partners') renderPartners();
+  } catch (err) {
+    $('#money-error').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderPartners() {
+  renderMoney();
   $('#partner-period').replaceChildren(...PERIODS.map(([key, label]) => el('button', {
     type: 'button', 'aria-pressed': String(state.partnerPeriod === key),
     onclick: () => { state.partnerPeriod = key; storage.set('uv.period', key); haptic('tap'); renderPartners(); },
@@ -2238,11 +2395,12 @@ function renderPartners() {
 
   const s = settlement();
   const settle = $('#partner-settle');
-  const who = (n) => (n === COMMON ? 'Касса' : n);
+  const who = (n) => (n === COMMON ? 'Общие' : n);
   const head = s.transfers.length
     ? [el('div', { class: 'muted' }, 'Деньги за проданные вещи получил не владелец — нужно передать:'),
       ...s.transfers.map((t) => el('div', { class: 'settle-transfer' },
-        el('b', {}, who(t.from)), el('span', { class: 'arrow' }, ' → '), el('b', {}, who(t.to)), el('div', { class: 'settle-amount' }, rub(t.amount))))]
+        el('b', {}, who(t.from)), el('span', { class: 'arrow' }, ' → '), el('b', {}, who(t.to)), el('div', { class: 'settle-amount' }, rub(t.amount)),
+        el('button', { type: 'button', class: 'link-btn settle-pay', onclick: () => openMoney('transfer', { from: t.from, to: t.to, amount: t.amount, note: 'Погашение долга за проданные вещи' }) }, 'Отметить перевод')))]
     : [el('div', { class: 'settle-transfer' }, el('b', {}, 'Никто никому не должен ✓'))];
   settle.replaceChildren(el('div', { class: 'settle-card' }, ...head,
     s.skipped ? el('p', { class: 'muted' }, `Не учтено продаж без «Кто платил» или «Деньги получил»: ${s.skipped}.`) : null));
@@ -2436,6 +2594,7 @@ const demoDb = (() => {
   return {
     stamp,
     photos: new Map(), // id → { mime, base64 } — загруженные в демо фото
+    money: [],
     items: [
       { ...base, id: 'd0000001', title: 'Пуховик The North Face Nuptse', category: 'Куртки', brand: 'The North Face', size: 'M', condition: 'Хорошее', source: 'Выкуп', buyPrice: 9000, buyDate: d(140), planPrice: 17000, status: 'Продано', salePrice: 16000, saleDate: d(110), authenticity: 'Проверено', buyer: 'Антон', soldBy: 'Антон' },
       { ...base, id: 'd0000002', title: 'Кроссовки Nike Dunk Low', category: 'Обувь', brand: 'Nike', country: 'Китай', size: '42', condition: 'Новое с бирками', source: 'Выкуп', buyPrice: 9000, buyDate: d(75), planPrice: 15000, status: 'Продано', salePrice: 14500, saleDate: d(40), authenticity: 'Проверено', buyer: 'Дима', soldBy: 'Антон' },
@@ -2498,6 +2657,21 @@ async function demoApi(action, p) {
     case 'meta': return { user: { id: 0, name: 'Антон' }, partners: ['Антон', 'Дима'], lists: { ...DEFAULT_LISTS, category: ['Куртки', 'Худи', 'Обувь', 'Сумки', 'Аксессуары', 'Футболки'] } };
     case 'list': return JSON.parse(JSON.stringify(demoDb.items));
     case 'history': return demoLog.slice().reverse().slice(0, 50);
+    case 'money': return JSON.parse(JSON.stringify(demoDb.money));
+    case 'moneyAdd': {
+      const nid = () => Math.random().toString(16).slice(2, 10);
+      const date = isoToRu(p.date || todayIso());
+      if (p.kind === 'transfer') {
+        const link = nid();
+        demoDb.money.push({ id: nid(), date, wallet: p.wallet, amount: -p.amount, note: p.note || '', link }, { id: nid(), date, wallet: p.to, amount: p.amount, note: p.note || '', link });
+      } else demoDb.money.push({ id: nid(), date, wallet: p.wallet, amount: p.kind === 'in' ? p.amount : -p.amount, note: p.note || '', link: '' });
+      return { ok: true };
+    }
+    case 'moneyDelete': {
+      const hit = demoDb.money.find((m) => m.id === p.id);
+      demoDb.money = demoDb.money.filter((m) => m.id !== p.id && !(hit && hit.link && m.link === hit.link));
+      return { removed: 1 };
+    }
     case 'photos': {
       const out = {};
       p.ids.forEach((id) => {
@@ -2583,7 +2757,11 @@ function bindEvents() {
   });
   $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; storage.set('uv.sort', state.sort); renderList(); });
   $('#btn-add').addEventListener('click', () => openForm('add'));
-  $('#btn-refresh').addEventListener('click', () => loadItems().then(() => toast('Обновлено')).catch((e) => toast(e.message)));
+  $('#btn-refresh').addEventListener('click', () => Promise.all([loadItems(), loadMoney()]).then(() => toast('Обновлено')).catch((e) => toast(e.message)));
+  document.querySelectorAll('[data-money]').forEach((b) => b.addEventListener('click', () => openMoney(b.dataset.money)));
+  $('#money-form').addEventListener('submit', submitMoney);
+  $('#money-cancel').addEventListener('click', () => { $('#money-sheet').hidden = true; });
+  $('#money-sheet').addEventListener('click', (e) => { if (e.target.id === 'money-sheet') $('#money-sheet').hidden = true; });
   document.querySelectorAll('#bottom-nav [data-nav]').forEach((b) => b.addEventListener('click', () => navTo(b.dataset.nav)));
   $('#btn-layout').addEventListener('click', () => {
     setLayout(state.layout === 'grid' ? 'list' : 'grid');
@@ -2720,12 +2898,13 @@ async function init() {
     if (cached.lists) state.lists = { ...DEFAULT_LISTS, ...cached.lists };
     if (cached.user) state.user = cached.user;
     if (cached.partners) state.partners = cached.partners;
+    if (Array.isArray(cached.money)) state.money = cached.money;
     renderList();
     hideSplash(); // есть сохранённые данные — сразу к списку
     $('#list-note').textContent = 'Обновляю…';
   }
   try {
-    const [meta] = await Promise.all([api('meta'), loadItems({ silent: Boolean(cached) })]);
+    const [meta] = await Promise.all([api('meta'), loadItems({ silent: Boolean(cached) }), loadMoney()]);
     state.lists = { ...DEFAULT_LISTS, ...meta.lists };
     state.user = meta.user || null;
     state.partners = meta.partners || [];
