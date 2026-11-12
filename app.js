@@ -1610,10 +1610,10 @@ function reportText() {
   sold.slice(0, 10).forEach((i) => lines.push(`• ${i.title} — ${rub(i.salePrice)}${profitOf(i) !== null ? ' (' + signedRub(profitOf(i)) + ')' : ''}`));
   if (sold.length > 10) lines.push(`• …и ещё ${sold.length - 10}`);
   lines.push('', `Не продано: ${pieces(unsold.length)}${transit ? ` (в пути ${transit})` : ''}, вложено ${rub(invested)}`);
-  const totals = [...partnerTotals('month').values()].filter((t) => t.name && (t.buy || t.sale));
+  const totals = [...partnerTotals('month').values()].filter((t) => t.name && (t.buy || t.sale || t.profit));
   if (totals.length) {
-    lines.push('', 'По партнёрам за месяц:');
-    totals.forEach((t) => lines.push(`• ${t.name}: закупил ${rub(t.buy)}, продал ${rub(t.sale)}`));
+    lines.push('', 'По деньгам за месяц:');
+    totals.forEach((t) => lines.push(`• ${walletLabel(t.name)}: вложено ${rub(t.buy)}, продано ${rub(t.sale)}, прибыль ${signedRub(t.profit)}`));
   }
   return lines.join('\n');
 }
@@ -1667,7 +1667,7 @@ function openSell() {
   f.reset();
   f.salePrice.value = isNum(state.current.planPrice) ? state.current.planPrice : '';
   f.saleDate.value = todayIso();
-  fillPartnerSelect(f.soldBy, myName());
+  fillPartnerSelect(f.soldBy, lastWallet());
   // Быстрые цены: по плану, −5%, −10% (округление до сотни)
   const plan = state.current.planPrice;
   const quick = $('#sell-quick');
@@ -1712,8 +1712,9 @@ async function submitSell(e) {
   const item = state.current;
   const payload = {
     id: item.id, salePrice: Number(f.salePrice.value), saleDate: f.saleDate.value || todayIso(),
-    soldBy: f.soldBy.value || myName(), version: item.changedAt,
+    soldBy: f.soldBy.value, version: item.changedAt,
   };
+  rememberWallet(payload.soldBy);
   closeSheet();
   optimistic(item, {
     status: STATUS.sold, salePrice: payload.salePrice, saleDate: isoToRu(payload.saleDate), soldBy: payload.soldBy,
@@ -1732,12 +1733,16 @@ const BUY_ONLY_FIELDS = ['buyPrice', 'buyer', 'seller'];
 const myName = () => (state.user && state.user.name) || '';
 /** Общие деньги (касса) — третий «кошелёк» наряду с личными деньгами партнёров. */
 const COMMON = 'Общие';
-const walletLabel = (n) => (n === COMMON ? 'Общие (касса)' : n);
-/** Партнёры (люди): я первым, затем остальные. «Общие» сюда не входят. */
+const walletLabel = (n) => (n === COMMON ? 'Общая касса' : n);
+const DEFAULT_PARTNERS = ['Арсений', 'Сева'];
+/** Люди, за чьи деньги покупаются вещи. Фиксированный список (с сервера), не зависит от того, кто открыл бота. */
 function partnerList() {
-  const all = [myName(), ...state.partners].filter((n) => n && n !== COMMON);
+  const all = (state.partners && state.partners.length ? state.partners : DEFAULT_PARTNERS).filter((n) => n && n !== COMMON);
   return all.filter((n, i) => all.indexOf(n) === i);
 }
+/** Последний выбранный «кошелёк» на этом телефоне — подставляется по умолчанию. */
+const lastWallet = () => { const w = storage.get('uv.wallet'); return w && walletList().includes(w) ? w : ''; };
+const rememberWallet = (w) => { if (w) storage.set('uv.wallet', w); };
 /** Варианты для «Кто платил» / «Деньги получил»: касса и партнёры. */
 function walletList() {
   return [COMMON, ...partnerList()];
@@ -1808,7 +1813,7 @@ function openForm(mode, source) {
     setField(f, 'status', item.status);
     setField(f, 'salePrice', item.salePrice);
     setField(f, 'saleDate', ruToIso(item.saleDate) || todayIso());
-    setField(f, 'soldBy', item.soldBy || (item.status === STATUS.sold ? '' : myName()));
+    setField(f, 'soldBy', item.soldBy || (item.status === STATUS.sold ? '' : lastWallet()));
     state.form.hadPhoto = item.hasPhoto;
     if (item.hasPhoto) {
       const src = state.fullPhotos.get(item.id) || state.photos.get(item.id);
@@ -1830,7 +1835,7 @@ function openForm(mode, source) {
     if (!f.source.value && state.lists.source.includes('Выкуп')) f.source.value = 'Выкуп';
     if (!f.authenticity.value && state.lists.authenticity.includes('Не проверено')) f.authenticity.value = 'Не проверено';
     if (!f.category.value && state.category) f.category.value = state.category;
-    if (!f.buyer.value) setField(f, 'buyer', myName());
+    if (!f.buyer.value) setField(f, 'buyer', lastWallet());
     f.status.value = state.tab === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock;
   }
   syncFormExtras();
@@ -2101,6 +2106,29 @@ function renderStats() {
 
 const PERIODS = [['month', 'Этот месяц'], ['prev', 'Прошлый месяц'], ['all', 'Всё время']];
 
+/**
+ * Чья вещь: тот, за чьи деньги куплена («Кто платил»). Его затраты — и его прибыль.
+ * Комиссионная вещь своего человека (комитент — Арсений/Сева/касса) — его; чужая комиссионная — касса (наша комиссия).
+ */
+function ownerOf(i) {
+  if (isCommission(i)) return walletList().includes(i.consignor) ? i.consignor : COMMON;
+  return i.buyer || '';
+}
+/** Проданная вещь: кому сколько причитается. owner — владельцу, kassa — комиссия в кассу (у комиссионных своих). */
+function saleSplit(i) {
+  if (i.status !== STATUS.sold || !isNum(i.salePrice)) return null;
+  const owner = ownerOf(i);
+  if (isCommission(i)) {
+    const fee = commissionFrom(i, i.salePrice) || 0;
+    if (owner !== COMMON || walletList().includes(i.consignor)) {
+      // своя вещь на комиссии: владелец получает всё минус комиссию, комиссия — в кассу
+      return owner === COMMON ? { owner, owes: i.salePrice, profit: i.salePrice, kassa: 0 } : { owner, owes: i.salePrice - fee, profit: i.salePrice - fee, kassa: fee };
+    }
+    return { owner: COMMON, owes: fee, profit: fee, kassa: 0 }; // чужая: нам только комиссия
+  }
+  return { owner, owes: i.salePrice, profit: profitOf(i), kassa: 0 };
+}
+
 function inPeriod(ruDate, period) {
   if (period === 'all') return true;
   const d = parseRuDate(ruDate);
@@ -2110,65 +2138,60 @@ function inPeriod(ruDate, period) {
   return d.getMonth() === ref.getMonth() && d.getFullYear() === ref.getFullYear();
 }
 
-/** Суммы закупок и продаж по партнёрам за период. Ключ '' — «не указано». */
+/**
+ * Итоги по каждому «кошельку» (касса, Арсений, Сева) за период. Ключ '' — «не указано, чьи деньги».
+ * buy — вложил в закупки; sale/profit — выручка и прибыль с ЕГО проданных вещей; stock — деньги в его непроданных вещах (сейчас).
+ */
 function partnerTotals(period) {
   const t = new Map();
   const get = (name) => {
-    if (!t.has(name)) t.set(name, { name, buy: 0, buyCount: 0, sale: 0, saleCount: 0 });
+    if (!t.has(name)) t.set(name, { name, buy: 0, buyCount: 0, sale: 0, saleCount: 0, profit: 0, stock: 0, stockCount: 0 });
     return t.get(name);
   };
   walletList().forEach(get);
   state.items.forEach((i) => {
-    if (isNum(i.buyPrice) && i.buyPrice > 0 && inPeriod(i.buyDate, period)) {
-      const r = get(i.buyer || '');
-      r.buy += i.buyPrice; r.buyCount++;
+    const owner = ownerOf(i);
+    if (isNum(i.buyPrice) && i.buyPrice > 0 && !isCommission(i)) {
+      if (inPeriod(i.buyDate, period)) { const r = get(owner); r.buy += i.buyPrice; r.buyCount++; }
+      if (i.status !== STATUS.sold) { const r = get(owner); r.stock += i.buyPrice; r.stockCount++; }
     }
-    if (i.status === STATUS.sold && isNum(i.salePrice) && inPeriod(i.saleDate, period)) {
-      const r = get(i.soldBy || '');
-      r.sale += i.salePrice; r.saleCount++;
+    const split = saleSplit(i);
+    if (split && inPeriod(i.saleDate, period)) {
+      const r = get(split.owner);
+      r.sale += split.owes; r.saleCount++; r.profit += split.profit || 0;
+      if (split.kassa) { const k = get(COMMON); k.sale += split.kassa; k.profit += split.kassa; }
     }
   });
   return t;
 }
 
 /**
- * Взаиморасчёт поровну за всё время. Комиссионные вещи — только наша комиссия (долю комитента отдаёт тот, кто получил деньги).
- * Каждый: получил от продаж − заплатил за закупки = «на руках». Поровну — это общий итог / число партнёров.
- * Кто держит больше своей доли — переводит разницу тем, у кого меньше.
+ * Кто кому должен (за всё время). Каждая проданная вещь — деньги её владельца.
+ * Если деньги получил другой человек (или касса), он должен их владельцу. Встречные долги взаимозачитываются.
  */
 function settlement() {
-  const net = new Map();
+  const debt = new Map(); // 'от→кому' → сумма
   let skipped = 0;
-  const add = (name, v) => net.set(name, (net.get(name) || 0) + v);
+  const add = (from, to, v) => {
+    if (!v || from === to) return;
+    const k = from + '→' + to;
+    debt.set(k, (debt.get(k) || 0) + v);
+  };
   state.items.forEach((i) => {
-    if (isCommission(i)) {
-      // Комиссионная: кто получил деньги, тот отдаёт долю комитенту — у него остаётся наша комиссия.
-      const ours = profitOf(i);
-      if (i.status === STATUS.sold && ours !== null) { if (i.soldBy) add(i.soldBy, ours); else skipped++; }
-      return;
-    }
-    if (isNum(i.buyPrice) && i.buyPrice > 0) { if (i.buyer) add(i.buyer, -i.buyPrice); else skipped++; }
-    if (i.status === STATUS.sold && isNum(i.salePrice)) { if (i.soldBy) add(i.soldBy, i.salePrice); else skipped++; }
+    const split = saleSplit(i);
+    if (!split) return;
+    if (!i.soldBy || !split.owner) { skipped++; return; }
+    add(i.soldBy, split.owner, split.owes);
+    if (split.kassa) add(i.soldBy, COMMON, split.kassa);
   });
-  partnerList().forEach((n) => { if (!net.has(n)) net.set(n, 0); });
-  // Касса общая (поровну) — на перевод между партнёрами не влияет, показываем отдельно
-  const common = net.get(COMMON) || 0;
-  net.delete(COMMON);
-  const names = [...net.keys()];
-  const total = names.reduce((s, n) => s + net.get(n), 0);
-  const share = names.length ? total / names.length : 0;
-  const bal = names.map((n) => ({ name: n, owe: Math.round(net.get(n) - share) }));
+  const names = walletList();
   const transfers = [];
-  const payers = bal.filter((b) => b.owe > 0).sort((a, b) => b.owe - a.owe);
-  const takers = bal.filter((b) => b.owe < 0).sort((a, b) => a.owe - b.owe);
-  for (const p of payers) {
-    for (const t of takers) {
-      if (p.owe <= 0) break;
-      const amount = Math.min(p.owe, -t.owe);
-      if (amount > 0) { transfers.push({ from: p.name, to: t.name, amount }); p.owe -= amount; t.owe += amount; }
-    }
-  }
-  return { names, total, share, transfers, skipped, common };
+  names.forEach((a, ai) => names.slice(ai + 1).forEach((b) => {
+    const net = Math.round((debt.get(a + '→' + b) || 0) - (debt.get(b + '→' + a) || 0));
+    if (net > 0) transfers.push({ from: a, to: b, amount: net });
+    else if (net < 0) transfers.push({ from: b, to: a, amount: -net });
+  }));
+  return { names, transfers, skipped };
 }
 
 function renderPartners() {
@@ -2185,31 +2208,28 @@ function renderPartners() {
   box.classList.toggle('single', cards.length < 2);
   box.classList.toggle('three', cards.length === 3);
   box.replaceChildren(...cards.map((c) => {
-    const diff = c.sale - c.buy;
     const isCommon = c.name === COMMON;
-    return el('div', { class: 'partner-card' + (c.name === myName() ? ' me' : '') + (isCommon ? ' common' : '') },
-      el('div', { class: 'partner-name' }, isCommon ? '🏦 Общая касса' : c.name, c.name === myName() ? el('span', { class: 'badge info' }, 'вы') : null),
-      el('div', { class: 'partner-row' }, el('span', {}, isCommon ? 'Потрачено' : 'Закупил'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
-      el('div', { class: 'partner-row' }, el('span', {}, isCommon ? 'Пришло' : 'Продал'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
-      el('div', { class: 'partner-row total' }, el('span', {}, isCommon ? 'В кассе' : 'Разница'),
-        el('b', { class: diff < 0 ? 'profit-minus' : diff > 0 ? 'profit-plus' : '' }, signedRub(diff))));
+    return el('div', { class: 'partner-card' + (isCommon ? ' common' : '') },
+      el('div', { class: 'partner-name' }, isCommon ? '🏦 Общая касса' : c.name),
+      el('div', { class: 'partner-row' }, el('span', {}, 'Вложено'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
+      el('div', { class: 'partner-row' }, el('span', {}, 'Продано'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
+      el('div', { class: 'partner-row total' }, el('span', {}, 'Прибыль'),
+        el('b', { class: c.profit < 0 ? 'profit-minus' : c.profit > 0 ? 'profit-plus' : '' }, signedRub(c.profit))),
+      el('div', { class: 'partner-row stock' }, el('span', {}, 'В товаре сейчас'), el('b', {}, rub(c.stock)), el('small', {}, pieces(c.stockCount))));
   }));
-  if (cards.filter((c) => c.name !== COMMON).length < 2) {
-    box.append(el('p', { class: 'muted' }, 'Второй партнёр появится здесь, когда его Telegram ID будет в ALLOWED_IDS и он откроет бота, '
-      + 'или когда его имя будет указано в «Кто платил» / «Деньги получил».'));
-  }
 
   // Вещи без партнёра — с подсказкой и списком
   const unk = $('#partner-unknown');
   const missing = state.items.filter((i) => (isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer)
     || (i.status === STATUS.sold && isNum(i.salePrice) && !i.soldBy));
+  // (чьи деньги не указаны — вещь ничья: её затраты и прибыль никому не засчитаны)
   if (missing.length) {
     const sums = unknown ? `За период: закупки ${rub(unknown.buy)}, продажи ${rub(unknown.sale)}. ` : '';
     const list = el('ul', { class: 'items', hidden: true }, missing.slice(0, 30).map((i) => itemRow(i)));
     const noBuyer = missing.filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer).map((i) => i.id);
     unk.replaceChildren(el('div', { class: 'notice' },
-      el('b', {}, `Не указан партнёр: ${pieces(missing.length)}`),
-      el('p', {}, `${sums}Можно указать «Кто платил» сразу всем — или по одной: вещь → «Изменить».`),
+      el('b', {}, `Не указано, чьи деньги: ${pieces(missing.length)}`),
+      el('p', {}, `${sums}Эти вещи никому не засчитаны. Укажите «Кто платил» сразу всем — или по одной: вещь → «Изменить».`),
       el('div', { class: 'notice-actions' },
         noBuyer.length ? el('button', { type: 'button', class: 'primary', onclick: () => bulkFillBuyer(noBuyer) }, `Указать разом (${noBuyer.length})`) : null,
         el('button', { type: 'button', class: 'link-btn', onclick: (e) => { list.hidden = !list.hidden; e.target.textContent = list.hidden ? 'Показать вещи' : 'Скрыть'; } }, 'Показать вещи')),
@@ -2218,20 +2238,14 @@ function renderPartners() {
 
   const s = settlement();
   const settle = $('#partner-settle');
-  if (s.names.length < 2) {
-    settle.replaceChildren(el('p', { class: 'muted' }, 'Расчёт появится, когда в учёте будут два партнёра.'));
-  } else {
-    const head = s.transfers.length
-      ? [el('div', { class: 'muted' }, 'Кто кому переводит, чтобы всё было поровну:'),
-        ...s.transfers.map((t) => el('div', { class: 'settle-transfer' },
-          el('b', {}, t.from), el('span', { class: 'arrow' }, ' → '), el('b', {}, t.to), el('div', { class: 'settle-amount' }, rub(t.amount))))]
-      : [el('div', { class: 'settle-transfer' }, el('b', {}, 'Вы в расчёте ✓'))];
-    settle.replaceChildren(el('div', { class: 'settle-card' },
-      ...head,
-      el('p', { class: 'muted' }, `Личные деньги (продажи − закупки): ${signedRub(s.total)}, доля каждого ${signedRub(Math.round(s.share))}. `
-        + `В общей кассе за всё время: ${signedRub(s.common)} — она общая, делится поровну.`
-        + (s.skipped ? ` Без партнёра не учтено записей: ${s.skipped}.` : ''))));
-  }
+  const who = (n) => (n === COMMON ? 'Касса' : n);
+  const head = s.transfers.length
+    ? [el('div', { class: 'muted' }, 'Деньги за проданные вещи получил не владелец — нужно передать:'),
+      ...s.transfers.map((t) => el('div', { class: 'settle-transfer' },
+        el('b', {}, who(t.from)), el('span', { class: 'arrow' }, ' → '), el('b', {}, who(t.to)), el('div', { class: 'settle-amount' }, rub(t.amount))))]
+    : [el('div', { class: 'settle-transfer' }, el('b', {}, 'Никто никому не должен ✓'))];
+  settle.replaceChildren(el('div', { class: 'settle-card' }, ...head,
+    s.skipped ? el('p', { class: 'muted' }, `Не учтено продаж без «Кто платил» или «Деньги получил»: ${s.skipped}.`) : null));
 }
 
 /** «5 мин назад» из «10.11.2026 14:05:00». */
@@ -2639,7 +2653,27 @@ function bindEvents() {
   });
 }
 
+// ---- заставка с логотипом
+const SPLASH_BG = '#1b1511';
+const splashShownAt = Date.now();
+const SPLASH_MIN_MS = 700;
+let splashDone = false;
+function hideSplash() {
+  if (splashDone) return;
+  splashDone = true;
+  setTimeout(() => {
+    const sp = document.getElementById('splash');
+    document.documentElement.classList.remove('booting');
+    // Шапка и фон Telegram — обратно в цвет приложения
+    try { if (tg && tg.setHeaderColor) tg.setHeaderColor('bg_color'); if (tg && tg.setBackgroundColor) tg.setBackgroundColor('bg_color'); } catch (e) { /* старый Telegram */ }
+    if (!sp) return;
+    sp.classList.add('gone');
+    setTimeout(() => sp.remove(), 500);
+  }, Math.max(0, SPLASH_MIN_MS - (Date.now() - splashShownAt)));
+}
+
 function showFatal(message) {
+  hideSplash();
   document.body.classList.add('fatal');
   $('#items').replaceChildren(el('li', {}, el('div', { class: 'empty' }, icon('box'), el('p', {}, message))));
   $('#list-note').textContent = '';
@@ -2647,16 +2681,17 @@ function showFatal(message) {
 }
 
 async function init() {
+  setTimeout(hideSplash, 8000);
   if (tg && tg.initData) {
     document.documentElement.classList.add('tg');
     if (tg.colorScheme === 'dark') document.documentElement.classList.add('tg-dark');
     tg.onEvent && tg.onEvent('themeChanged', () => document.documentElement.classList.toggle('tg-dark', tg.colorScheme === 'dark'));
     tg.ready();
     tg.expand();
-    // Шапка и фон Telegram — в цвет приложения, без видимой границы
+    // Пока видна заставка — шапка Telegram в цвет логотипа; потом — в цвет приложения (hideSplash)
     try {
-      if (tg.setHeaderColor) tg.setHeaderColor('bg_color');
-      if (tg.setBackgroundColor) tg.setBackgroundColor('bg_color');
+      if (tg.setHeaderColor) tg.setHeaderColor(SPLASH_BG);
+      if (tg.setBackgroundColor) tg.setBackgroundColor(SPLASH_BG);
     } catch (e) { /* старый Telegram */ }
     tg.BackButton.onClick(goBack);
     try { tg.MainButton.onClick(() => { if (state.view === 'form') $('#item-form').requestSubmit(); }); } catch (e) { /* нет */ }
@@ -2686,6 +2721,7 @@ async function init() {
     if (cached.user) state.user = cached.user;
     if (cached.partners) state.partners = cached.partners;
     renderList();
+    hideSplash(); // есть сохранённые данные — сразу к списку
     $('#list-note').textContent = 'Обновляю…';
   }
   try {
@@ -2695,6 +2731,7 @@ async function init() {
     state.partners = meta.partners || [];
     saveCache();
     renderList();
+    hideSplash();
   } catch (e) {
     if (state.items.length && e.code === 'network') {
       toast('Нет связи — показаны сохранённые данные', 4500);

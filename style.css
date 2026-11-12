@@ -625,3 +625,29 @@ body[data-view="list"] .toast, body[data-view="stats"] .toast { bottom: calc(86p
 .search-row .sort { max-width: 34%; }
 .tg-dark .bottom-nav { box-shadow: 0 10px 30px rgba(0,0,0,.4), inset 0 0 0 1px rgba(255,255,255,.06); }
 @media (prefers-color-scheme: dark) { :root:not(.tg) .bottom-nav { box-shadow: 0 10px 30px rgba(0,0,0,.4), inset 0 0 0 1px rgba(255,255,255,.06); } }
+
+/* ======================================================================
+   Заставка: логотип The Game of Lantana светится, пока грузятся данные
+   ====================================================================== */
+.splash {
+  position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+  background: radial-gradient(120% 80% at 50% 45%, #2a211b 0%, #1b1511 55%, #140f0c 100%);
+  color: #ece6dd; transition: opacity .45s ease, visibility .45s ease;
+}
+.splash.gone { opacity: 0; visibility: hidden; pointer-events: none; }
+.splash-logo { text-align: center; padding: 0 24px; animation: splashIn .7s cubic-bezier(.2,.8,.2,1) both; }
+.splash-title {
+  font-family: "Bodoni 72", "Didot", "Playfair Display", Georgia, "Times New Roman", serif;
+  font-weight: 800; font-size: clamp(34px, 11vw, 56px); line-height: .98; letter-spacing: -.01em;
+  animation: splashGlow 2.2s ease-in-out infinite;
+}
+.splash-sub {
+  margin-top: 16px; font: 600 10.5px/1 -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: .42em; padding-left: .42em; color: #cfc6ba; opacity: .85;
+}
+@keyframes splashIn { from { opacity: 0; transform: translateY(8px) scale(.98); } }
+@keyframes splashGlow {
+  0%, 100% { text-shadow: 0 0 0 rgba(255, 236, 210, 0); opacity: .88; }
+  50% { text-shadow: 0 0 18px rgba(255, 236, 210, .45), 0 0 42px rgba(255, 214, 170, .18); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) { .splash-title, .splash-logo { animation: none; } }
