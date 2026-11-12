@@ -27,7 +27,7 @@ const state = {
   user: null,         // { id, name } — кто открыл приложение
   partners: [],       // имена партнёров для «Кто платил» / «Деньги получил»
   statsTab: 'general',
-  partnerPeriod: 'month',
+  partnerPeriod: (() => { try { const p = JSON.parse(localStorage.getItem('uv.period') || 'null'); return ['month', 'prev', 'all'].includes(p) ? p : 'all'; } catch (e) { return 'all'; } })(), // по умолчанию — всё время
   tab: STATUS.inStock,
   category: '',
   query: '',
@@ -2197,7 +2197,7 @@ function settlement() {
 function renderPartners() {
   $('#partner-period').replaceChildren(...PERIODS.map(([key, label]) => el('button', {
     type: 'button', 'aria-pressed': String(state.partnerPeriod === key),
-    onclick: () => { state.partnerPeriod = key; haptic('tap'); renderPartners(); },
+    onclick: () => { state.partnerPeriod = key; storage.set('uv.period', key); haptic('tap'); renderPartners(); },
   }, label)));
 
   const totals = partnerTotals(state.partnerPeriod);
