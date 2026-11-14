@@ -669,3 +669,7 @@ body[data-view="list"] .toast, body[data-view="stats"] .toast { bottom: calc(86p
 .money-op .history-text { flex: 1; }
 .op-del { flex: none; width: 32px; height: 32px; min-height: 32px; padding: 0; border-radius: 50%; background: transparent; color: var(--hint); font-size: 20px; line-height: 1; }
 .settle-pay { display: block; margin-top: 4px; font-size: 13.5px; padding: 4px 0; }
+.partner-free { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; margin: 2px 0 6px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.partner-free span { font-size: 12.5px; color: var(--hint); }
+.partner-free b { font-size: 17px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.partner-card .partner-name + .partner-free { margin-top: 0; }
