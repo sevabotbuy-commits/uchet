@@ -2251,7 +2251,7 @@ async function loadMoney() {
  * clothes — деньги в непроданных вещах (по «Кто платил»).
  */
 function moneyByWallet() {
-  const w = new Map(cashWallets().map((n) => [n, { name: n, free: 0, own: 0, clothes: 0, clothesCount: 0, ops: 0, sales: 0, buys: 0 }]));
+  const w = new Map(cashWallets().map((n) => [n, { name: n, free: 0, own: 0, clothes: 0, clothesCount: 0, ops: 0, sales: 0, buys: 0, byStatus: {} }]));
   const get = (n) => w.get(walletOf(n)) || null;
   let unknownBuy = 0, unknownBuyCount = 0, unknownSale = 0;
   // События по времени: пополнения/выводы (0), закупки (1), продажи (2). Без даты: закупка — в начало, продажа — в конец.
@@ -2264,7 +2264,11 @@ function moneyByWallet() {
       if (r) {
         ev.push({ r, at: t(i.buyDate, -Infinity), order: 1, amount: -i.buyPrice, buy: true });
         r.buys += i.buyPrice;
-        if (i.status !== STATUS.sold) { r.clothes += i.buyPrice; r.clothesCount++; }
+        if (i.status !== STATUS.sold) {
+          r.clothes += i.buyPrice; r.clothesCount++;
+          const st = r.byStatus[i.status] || (r.byStatus[i.status] = { sum: 0, count: 0 });
+          st.sum += i.buyPrice; st.count++;
+        }
       } else { unknownBuy += i.buyPrice; unknownBuyCount++; }
     }
     if (i.status === STATUS.sold && isNum(i.salePrice)) {
@@ -2414,13 +2418,15 @@ function renderMoney() {
     el('button', { type: 'button', class: 'money-name name-link', onclick: () => openOwner(w.name) }, w.name === COMMON ? '🏦 Общие' : '👤 ' + w.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
     el('div', { class: 'money-free-label' }, 'Свободные'),
     el('div', { class: 'money-free ' + (w.free < 0 ? 'profit-minus' : '') }, rub(w.free)),
-    el('div', { class: 'money-row' }, el('span', {}, 'В одежде'), el('b', {}, rub(w.clothes)), el('small', {}, pieces(w.clothesCount))),
-    w.own > 0 ? el('div', { class: 'money-row' }, el('span', {}, 'Вложено своих'), el('b', {}, rub(w.own)), el('small', {}, 'закупки сверх свободных денег')) : null,
-    el('div', { class: 'money-row total' }, el('span', {}, 'Всего'), el('b', {}, rub(w.free + w.clothes))))));
+    ...[[STATUS.inStock, 'В наличии'], [STATUS.inTransit, 'В пути'], [STATUS.reserved, 'В брони']].map(([st, label]) => {
+      const v = w.byStatus[st] || { sum: 0, count: 0 };
+      return el('div', { class: 'money-row' }, el('span', {}, label), el('b', {}, rub(v.sum)), el('small', {}, pieces(v.count)));
+    }),
+    el('div', { class: 'money-row total' }, el('span', {}, 'Общее'), el('b', {}, rub(w.free + w.clothes))))));
   const notes = [];
   if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Кто платил» — не вычтены ни из чьих денег.`);
   if (m.unknownSale) notes.push(`Продаж без «Деньги получил»: ${m.unknownSale} — не учтены.`);
-  if (!state.money.length && state.moneyStatus === 'ok') notes.push('Если на закупку не хватало свободных денег, недостающее считается «вложено своих». Живые деньги на руках внесите кнопкой «Пополнить».');
+  if (!state.money.length && state.moneyStatus === 'ok') notes.push('Живые деньги на руках внесите кнопкой «Пополнить».');
   $('#money-note').textContent = notes.join(' ');
   // последние операции
   const allOps = state.money.slice().reverse().filter((op, i, arr) => !op.link || arr.findIndex((o) => o.link === op.link) === i);
