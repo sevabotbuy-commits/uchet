@@ -45,7 +45,8 @@ const state = {
   navIds: [],
   select: null,       // режим выделения: Set выбранных id или null
   layout: 'grid',
-  money: [],          // журнал денег: пополнения, выводы, переводы     // вид склада: 'grid' — плитка с крупными фото, 'list' — строки
+  money: [],          // журнал денег: пополнения, выводы, переводы
+  moneyStatus: 'idle', // idle | loading | ok | error — чтобы при сбое не показывать «нули» как правду     // вид склада: 'grid' — плитка с крупными фото, 'list' — строки
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -350,7 +351,7 @@ function persistCache() {
 }
 
 async function loadItems({ silent = false, force = false } = {}) {
-  if (state.loading) return;
+  if (state.loading) { if (force) state.reloadAfter = true; return; }
   // Пока сохраняются изменения, не затираем их старыми данными с сервера (кроме случая конфликта — force).
   if (state.pending && !force) return;
   const seq = state.seq;
@@ -377,6 +378,7 @@ async function loadItems({ silent = false, force = false } = {}) {
     prefetchThumbs();
   } finally {
     setLoading(false);
+    if (state.reloadAfter) { state.reloadAfter = false; loadItems({ silent: true, force: true }).catch(() => {}); }
   }
 }
 
@@ -866,7 +868,7 @@ async function applyBulk(field, value) {
   try {
     await api('bulkUpdate', { ids, patch: { [field]: value } });
     state.pending--;
-    if (!state.pending) await loadItems({ silent: true });
+    if (!state.pending) loadItems({ silent: true }).catch(() => {}); // запись уже прошла — сбой обновления не откатывает её
   } catch (e) {
     state.pending--;
     targets.forEach((i, k) => { Object.keys(i).forEach((key) => delete i[key]); Object.assign(i, before[k]); });
@@ -882,6 +884,7 @@ function fillSoldBy(items) {
   openPicker(`Кто получил деньги (${pieces(items.length)})`, walletList().map((n) => [n, walletLabel(n)]), async (name) => {
     rememberWallet(name);
     let failed = 0;
+    state.pending++;
     for (const stale of items) {
       const item = state.items.find((i) => i.id === stale.id);
       if (!item) continue;
@@ -892,6 +895,7 @@ function fillSoldBy(items) {
         if (res && res.version) item.changedAt = res.version;
       } catch (e) { failed++; item.soldBy = ''; }
     }
+    state.pending--;
     saveCache();
     if (state.view === 'stats') renderStats();
     toast(failed ? `Не удалось: ${failed}. Обновите и попробуйте ещё раз.` : `Деньги получил: ${walletLabel(name)} ✓`);
@@ -928,7 +932,7 @@ async function bulkDelete() {
   try {
     await api('bulkDelete', { ids });
     state.pending--;
-    if (!state.pending) await loadItems({ silent: true });
+    if (!state.pending) loadItems({ silent: true }).catch(() => {}); // запись уже прошла — сбой обновления не откатывает её
   } catch (e) {
     state.pending--;
     state.items = snapshot;
@@ -1006,7 +1010,7 @@ async function deleteItem(stale) {
     try {
       await api('delete', { id: item.id, version });
       state.pending--;
-      if (!state.pending) await loadItems({ silent: true });
+      if (!state.pending) loadItems({ silent: true }).catch(() => {}); // запись уже прошла — сбой обновления не откатывает её
     } catch (e) {
       state.pending--;
       restore();
@@ -1241,6 +1245,7 @@ function paintPhoto(id, src) {
 // Миниатюры — пачками по 8 одним запросом (сервер отвечает ~1 с на запрос, а не на фото), 2 запроса параллельно.
 const PHOTO_BATCH = 8;
 const PHOTO_PARALLEL = 3;
+const photoRetries = new Map(); // id → сколько раз не удалось из-за сети
 function pumpPhotos() {
   while (photoActive < PHOTO_PARALLEL && photoQueue.length) {
     const batch = [];
@@ -1252,8 +1257,17 @@ function pumpPhotos() {
     if (!batch.length) continue;
     photoActive++;
     api('photos', { ids: batch })
-      .catch(() => ({}))
+      .catch(() => null)
       .then((res) => {
+        if (res === null) {
+          // Нет связи: оставляем заглушку и пробуем ещё раз через 5 с (до 3 попыток на фото)
+          batch.forEach((id) => {
+            const n = (photoRetries.get(id) || 0) + 1;
+            photoRetries.set(id, n);
+            if (n <= 3) setTimeout(() => { if (!state.photos.has(id)) { photoQueue.push({ id }); pumpPhotos(); } }, 5000 * n);
+          });
+          return;
+        }
         batch.forEach((id) => {
           const ph = res && res[id];
           const src = ph ? `data:${ph.mime};base64,${ph.base64}` : null;
@@ -1266,6 +1280,9 @@ function pumpPhotos() {
           }
           paintPhoto(id, src);
         });
+      })
+      .catch(() => { /* сбой отрисовки одной картинки не должен останавливать очередь */ })
+      .finally(() => {
         photoActive--;
         pumpPhotos();
       });
@@ -1568,7 +1585,7 @@ async function optimistic(stale, patch, call, okMessage, undoTo) {
     if (res && res.version) item.changedAt = res.version;
     state.pending--;
     resolveSaved(true);
-    if (!state.pending) await loadItems({ silent: true });
+    if (!state.pending) loadItems({ silent: true }).catch(() => {}); // запись уже прошла — сбой обновления не откатывает её
   } catch (e) {
     state.pending--;
     resolveSaved(false);
@@ -1784,6 +1801,8 @@ function fillPartnerSelect(sel, value) {
 }
 
 function fillSelects() {
+  const dl = document.getElementById('dl-wallets');
+  if (dl) dl.replaceChildren(...walletList().map((n) => el('option', { value: n })));
   document.querySelectorAll('select[data-list]').forEach((sel) => {
     const partners = sel.dataset.list === 'partners';
     const values = partners ? walletList() : (state.lists[sel.dataset.list] || []);
@@ -2012,6 +2031,7 @@ async function submitForm(e) {
   try {
     if (state.form.mode === 'edit') {
       const item = state.current;
+      state.seq++; // ответ загрузки, начатой до сохранения, уже устарел
       await api('update', Object.assign(data, { id: item.id, version: item.changedAt, photo, removePhoto: state.form.removePhoto }));
       if (photo) { state.photos.set(item.id, state.form.photo.dataUrl); state.fullPhotos.set(item.id, state.form.photo.dataUrl); photoKeys.set(item.id, 'local'); }
       if (state.form.removePhoto) { state.photos.delete(item.id); state.fullPhotos.delete(item.id); }
@@ -2022,6 +2042,7 @@ async function submitForm(e) {
       openItem(item.id, { push: false });
       state.stack = ['list'];
     } else {
+      state.seq++;
       const res = await api('add', Object.assign(data, { photo }));
       if (photo) { state.photos.set(res.id, state.form.photo.dataUrl); state.fullPhotos.set(res.id, state.form.photo.dataUrl); photoKeys.set(res.id, 'local'); }
       state.form.dirty = false;
@@ -2129,7 +2150,7 @@ function renderStats() {
   $('#stats-partners').hidden = state.statsTab !== 'partners';
   $('#stats-journal').hidden = state.statsTab !== 'journal';
   syncNav();
-  if (state.statsTab === 'partners') renderPartners();
+  if (state.statsTab === 'partners') { renderPartners(); if (state.moneyStatus !== 'loading') loadMoney(); }
   else if (state.statsTab === 'journal') loadHistory();
   else renderGeneralStats();
 }
@@ -2148,6 +2169,12 @@ const CASH_OF = { 'Арсений': COMMON };
 /** Куда ложатся деньги с продажи, полученные этим человеком. */
 const cashWallet = (n) => CASH_OF[n] || n;
 function cashWallets() { return walletList(); }
+/** Имя из таблицы → кошелёк из списка («сева », «СЕВА» → «Сева»). Чужое/старое имя → '' (не указано). */
+function walletOf(n) {
+  const k = String(n || '').trim().toLowerCase();
+  if (!k) return '';
+  return walletList().find((w) => w.toLowerCase() === k) || '';
+}
 /** Кошельки для долгов: Арсений и касса — одно целое (его выручка и так в кассе). */
 function debtWallets() {
   const all = walletList().map(cashWallet);
@@ -2156,10 +2183,21 @@ function debtWallets() {
 const cashLabel = (n) => (n === COMMON ? 'Общие' : n);
 
 async function loadMoney() {
+  if (state.moneyStatus !== 'ok') state.moneyStatus = 'loading';
+  const seq = state.moneySeq = (state.moneySeq || 0) + 1;
   try {
     const rows = await api('money');
-    if (Array.isArray(rows)) { state.money = rows; persistCache(); }
-  } catch (e) { /* без журнала денег — остальное работает */ }
+    if (!Array.isArray(rows)) throw new Error('Неожиданный ответ сервера');
+    if (seq !== state.moneySeq) return; // пока ждали, деньги меняли — этот ответ устарел
+    state.money = rows;
+    state.moneyStatus = 'ok';
+    persistCache();
+  } catch (e) {
+    // Сбой журнала не ломает остальное, но деньги без него показывать нельзя — будут неверные суммы
+    state.moneyStatus = state.money.length ? 'stale' : 'error';
+    state.moneyError = e.message;
+  }
+  if (state.view === 'stats' && state.statsTab === 'partners') renderMoney();
 }
 
 /**
@@ -2167,26 +2205,43 @@ async function loadMoney() {
  * clothes — деньги в непроданных вещах (по «Кто платил»).
  */
 function moneyByWallet() {
-  const w = new Map(cashWallets().map((n) => [n, { name: n, free: 0, clothes: 0, clothesCount: 0, ops: 0, sales: 0, buys: 0 }]));
-  const get = (n) => (n ? w.get(n) : null);
+  const w = new Map(cashWallets().map((n) => [n, { name: n, free: 0, own: 0, clothes: 0, clothesCount: 0, ops: 0, sales: 0, buys: 0 }]));
+  const get = (n) => w.get(walletOf(n)) || null;
   let unknownBuy = 0, unknownBuyCount = 0, unknownSale = 0;
-  state.money.forEach((m) => { const r = get(m.wallet); if (r) { r.free += m.amount; r.ops += m.amount; } });
+  // События по времени: пополнения/выводы (0), закупки (1), продажи (2). Без даты: закупка — в начало, продажа — в конец.
+  const ev = [];
+  const t = (ru, dflt) => { const d = parseRuDate(ru); return d ? d.getTime() : dflt; };
+  state.money.forEach((m) => { const r = get(m.wallet); if (r) ev.push({ r, at: t(m.date, 0), order: 0, amount: m.amount, op: true }); });
   state.items.forEach((i) => {
     if (!isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0) {
       const r = get(i.buyer);
       if (r) {
-        r.free -= i.buyPrice; r.buys += i.buyPrice;
+        ev.push({ r, at: t(i.buyDate, -Infinity), order: 1, amount: -i.buyPrice, buy: true });
+        r.buys += i.buyPrice;
         if (i.status !== STATUS.sold) { r.clothes += i.buyPrice; r.clothesCount++; }
       } else { unknownBuy += i.buyPrice; unknownBuyCount++; }
     }
     if (i.status === STATUS.sold && isNum(i.salePrice)) {
-      const r = get(i.soldBy ? cashWallet(i.soldBy) : '');  // продажи Арсения — в общие
+      const holder = walletOf(i.soldBy);
+      const r = holder ? w.get(cashWallet(holder)) : null;  // продажи Арсения — в общие
       if (!r) { unknownSale++; return; }
       let cash = i.salePrice;
       // чужая вещь на комиссии: долю комитента отдали ему — у нас осталась комиссия
-      if (isCommission(i) && !walletList().includes(i.consignor)) cash = commissionFrom(i, i.salePrice) || 0;
-      r.free += cash; r.sales += cash;
+      if (isCommission(i) && !walletOf(i.consignor)) cash = commissionFrom(i, i.salePrice) || 0;
+      ev.push({ r, at: t(i.saleDate, Infinity), order: 2, amount: cash });
+      r.sales += cash;
     }
+  });
+  ev.sort((a, b) => (a.at - b.at) || (a.order - b.order));
+  ev.forEach((e) => {
+    if (e.op) e.r.ops += e.amount;
+    if (e.buy) {
+      // Не хватило свободных на закупку — недостающее вложено своими, свободные остаются на нуле
+      const need = -e.amount;
+      const avail = Math.max(0, e.r.free);
+      if (need > avail) e.r.own += need - avail;
+      e.r.free = Math.min(e.r.free, 0) + Math.max(0, avail - need);
+    } else e.r.free += e.amount;
   });
   return { wallets: [...w.values()], unknownBuy, unknownBuyCount, unknownSale };
 }
@@ -2196,8 +2251,8 @@ function moneyByWallet() {
  * Комиссионная вещь своего человека (комитент — Арсений/Сева/касса) — его; чужая комиссионная — касса (наша комиссия).
  */
 function ownerOf(i) {
-  if (isCommission(i)) return walletList().includes(i.consignor) ? i.consignor : COMMON;
-  return i.buyer || '';
+  if (isCommission(i)) return walletOf(i.consignor) || COMMON;
+  return walletOf(i.buyer);
 }
 /** Проданная вещь: кому сколько причитается. owner — владельцу, kassa — комиссия в кассу (у комиссионных своих). */
 function saleSplit(i) {
@@ -2205,7 +2260,7 @@ function saleSplit(i) {
   const owner = ownerOf(i);
   if (isCommission(i)) {
     const fee = commissionFrom(i, i.salePrice) || 0;
-    if (owner !== COMMON || walletList().includes(i.consignor)) {
+    if (owner !== COMMON || walletOf(i.consignor)) {
       // своя вещь на комиссии: владелец получает всё минус комиссию, комиссия — в кассу
       return owner === COMMON ? { owner, owes: i.salePrice, profit: i.salePrice, kassa: 0 } : { owner, owes: i.salePrice - fee, profit: i.salePrice - fee, kassa: fee };
     }
@@ -2235,7 +2290,7 @@ function partnerTotals(period) {
   };
   walletList().forEach(get);
   state.items.forEach((i) => {
-    const owner = ownerOf(i);
+    const owner = ownerOf(i); // '' — не указано или имя не из списка
     if (isNum(i.buyPrice) && i.buyPrice > 0 && !isCommission(i)) {
       if (inPeriod(i.buyDate, period)) { const r = get(owner); r.buy += i.buyPrice; r.buyCount++; }
       if (i.status !== STATUS.sold) { const r = get(owner); r.stock += i.buyPrice; r.stockCount++; }
@@ -2265,9 +2320,10 @@ function settlement() {
   state.items.forEach((i) => {
     const split = saleSplit(i);
     if (!split) return;
-    if (!i.soldBy || !split.owner) { skipped++; return; }
-    add(cashWallet(i.soldBy), cashWallet(split.owner), split.owes);
-    if (split.kassa) add(cashWallet(i.soldBy), COMMON, split.kassa);
+    const holder = walletOf(i.soldBy);
+    if (!holder || !split.owner) { skipped++; return; }
+    add(cashWallet(holder), cashWallet(split.owner), split.owes);
+    if (split.kassa) add(cashWallet(holder), COMMON, split.kassa);
   });
   // Переводы между кошельками гасят долг: перевод A → B уменьшает долг A перед B
   const links = new Map();
@@ -2275,7 +2331,7 @@ function settlement() {
   links.forEach((pair) => {
     const from = pair.find((m) => m.amount < 0);
     const to = pair.find((m) => m.amount > 0);
-    if (from && to) add(cashWallet(to.wallet), cashWallet(from.wallet), to.amount);
+    if (from && to && walletOf(from.wallet) && walletOf(to.wallet)) add(cashWallet(walletOf(to.wallet)), cashWallet(walletOf(from.wallet)), to.amount);
   });
   const names = debtWallets();
   const transfers = [];
@@ -2290,20 +2346,43 @@ function settlement() {
 function renderMoney() {
   const box = $('#money-cards');
   if (!box) return;
+  const st = state.moneyStatus;
+  const blocked = st === 'loading' || st === 'error' || st === 'idle';
+  document.querySelectorAll('[data-money]').forEach((b) => { b.disabled = blocked; });
+  const banner = $('#money-status');
+  if (st === 'error' || st === 'stale') {
+    banner.hidden = false;
+    banner.replaceChildren(el('b', {}, st === 'error' ? 'Не удалось загрузить журнал денег' : 'Журнал денег не обновился — показаны сохранённые данные'),
+      el('p', {}, (state.moneyError || 'Нет связи') + '. Суммы ниже могут быть неверными — не вносите операции повторно.'),
+      el('button', { type: 'button', class: 'primary', onclick: () => { state.moneyStatus = 'loading'; renderMoney(); loadMoney(); } }, 'Повторить'));
+  } else banner.hidden = true;
+  if (blocked) {
+    box.replaceChildren(...walletList().map(() => el('div', { class: 'money-card skel' })));
+    $('#money-note').textContent = '';
+    $('#money-ops').replaceChildren(el('li', { class: 'history-skel' }), el('li', { class: 'history-skel' }));
+    return;
+  }
   const m = moneyByWallet();
+  box.classList.toggle('odd', m.wallets.length % 2 === 1);
   box.replaceChildren(...m.wallets.map((w) => el('div', { class: 'money-card' + (w.name === COMMON ? ' common' : '') },
     el('div', { class: 'money-name' }, w.name === COMMON ? '🏦 Общие' : '👤 ' + w.name),
     el('div', { class: 'money-free-label' }, 'Свободные'),
     el('div', { class: 'money-free ' + (w.free < 0 ? 'profit-minus' : '') }, rub(w.free)),
     el('div', { class: 'money-row' }, el('span', {}, 'В одежде'), el('b', {}, rub(w.clothes)), el('small', {}, pieces(w.clothesCount))),
+    w.own > 0 ? el('div', { class: 'money-row' }, el('span', {}, 'Вложено своих'), el('b', {}, rub(w.own)), el('small', {}, 'закупки сверх свободных денег')) : null,
     el('div', { class: 'money-row total' }, el('span', {}, 'Всего'), el('b', {}, rub(w.free + w.clothes))))));
   const notes = [];
   if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Кто платил» — не вычтены ни из чьих денег.`);
   if (m.unknownSale) notes.push(`Продаж без «Деньги получил»: ${m.unknownSale} — не учтены.`);
-  if (!state.money.length) notes.push('Внесите стартовые суммы кнопкой «Пополнить» — иначе свободные деньги уйдут в минус на сумму закупок.');
+  if (!state.money.length && state.moneyStatus === 'ok') notes.push('Если на закупку не хватало свободных денег, недостающее считается «вложено своих». Живые деньги на руках внесите кнопкой «Пополнить».');
   $('#money-note').textContent = notes.join(' ');
   // последние операции
-  const ops = state.money.slice().reverse().filter((op, i, arr) => !op.link || arr.findIndex((o) => o.link === op.link) === i).slice(0, 15);
+  const allOps = state.money.slice().reverse().filter((op, i, arr) => !op.link || arr.findIndex((o) => o.link === op.link) === i);
+  const ops = state.moneyAllOps ? allOps : allOps.slice(0, 5);
+  const more = $('#money-more');
+  more.hidden = allOps.length <= 5;
+  more.textContent = state.moneyAllOps ? 'Свернуть' : `Все операции (${allOps.length})`;
+  more.onclick = () => { state.moneyAllOps = !state.moneyAllOps; renderMoney(); };
   $('#money-ops').replaceChildren(...(ops.length ? ops.map((op) => {
     const pair = op.link ? state.money.filter((o) => o.link === op.link) : [op];
     const from = pair.find((o) => o.amount < 0), to = pair.find((o) => o.amount > 0);
@@ -2321,15 +2400,21 @@ async function deleteMoneyOp(op) {
   if (!(await ask(op.link ? 'Удалить перевод целиком (обе стороны)?' : 'Удалить эту операцию?'))) return;
   const before = state.money;
   state.money = state.money.filter((o) => o.id !== op.id && !(op.link && o.link === op.link));
+  state.moneySeq = (state.moneySeq || 0) + 1; // «летящая» загрузка не вернёт удалённую операцию
   renderPartners();
   try {
     await api('moneyDelete', { id: op.id });
     toast('Операция удалена');
     loadMoney().then(() => { if (state.view === 'stats' && state.statsTab === 'partners') renderPartners(); });
   } catch (e) {
-    state.money = before;
+    if (e.code === 'notfound' || e.code === 'network') {
+      toast(e.code === 'notfound' ? 'Операция уже удалена' : 'Нет связи — проверяю, что на сервере');
+      await loadMoney();
+    } else {
+      state.money = before;
+      toast(e.message);
+    }
     renderPartners();
-    toast(e.message);
   }
 }
 
@@ -2338,6 +2423,7 @@ function openMoney(kind, preset) {
   const f = $('#money-form');
   f.reset();
   f.kind.value = kind;
+  f.dataset.opId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const fill = (sel, value) => {
     sel.replaceChildren(...cashWallets().map((n) => el('option', { value: n }, cashLabel(n))));
     sel.value = value || cashWallets()[0];
@@ -2362,7 +2448,7 @@ async function submitMoney(e) {
   const amount = Number(f.amount.value);
   if (!(amount > 0)) { $('#money-error').textContent = 'Укажите сумму больше нуля.'; f.amount.focus(); return; }
   if (f.kind.value === 'transfer' && f.to.value === f.wallet.value) { $('#money-error').textContent = 'Выберите разные кошельки.'; return; }
-  const payload = { kind: f.kind.value, wallet: f.wallet.value, to: f.to.value, amount, date: f.date.value || todayIso(), note: f.note.value.trim() };
+  const payload = { kind: f.kind.value, wallet: f.wallet.value, to: f.to.value, amount, date: f.date.value || todayIso(), note: f.note.value.trim(), opId: f.dataset.opId };
   const btn = f.querySelector('button[type=submit]');
   btn.disabled = true;
   try {
@@ -2373,7 +2459,9 @@ async function submitMoney(e) {
     await loadMoney();
     if (state.view === 'stats' && state.statsTab === 'partners') renderPartners();
   } catch (err) {
-    $('#money-error').textContent = err.message;
+    $('#money-error').textContent = err.code === 'network'
+      ? 'Нет связи — не ясно, записалось ли. Нажмите «Записать» ещё раз: дубля не будет.'
+      : err.message;
   } finally {
     btn.disabled = false;
   }
@@ -2409,8 +2497,8 @@ function renderPartners() {
 
   // Предупреждения: не указано, кто платил (закупка) / кто получил деньги (продажа) — это разные вещи
   const unk = $('#partner-unknown');
-  const noBuyerItems = state.items.filter((i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer);
-  const noSoldByItems = state.items.filter((i) => i.status === STATUS.sold && isNum(i.salePrice) && !i.soldBy);
+  const noBuyerItems = state.items.filter((i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && !walletOf(i.buyer));
+  const noSoldByItems = state.items.filter((i) => i.status === STATUS.sold && isNum(i.salePrice) && !walletOf(i.soldBy));
   const notice = (title, text, items, action) => {
     const list = el('ul', { class: 'items', hidden: true }, items.slice(0, 30).map((i) => itemRow(i)));
     return el('div', { class: 'notice' },
@@ -2888,7 +2976,8 @@ function hideSplash() {
 function showFatal(message) {
   hideSplash();
   document.body.classList.add('fatal');
-  $('#items').replaceChildren(el('li', {}, el('div', { class: 'empty' }, icon('box'), el('p', {}, message))));
+  $('#items').replaceChildren(el('li', {}, el('div', { class: 'empty' }, icon('box'), el('p', {}, message),
+    el('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, 'Повторить'))));
   $('#list-note').textContent = '';
   $('#btn-add').hidden = true;
 }
@@ -2933,7 +3022,7 @@ async function init() {
     if (cached.lists) state.lists = { ...DEFAULT_LISTS, ...cached.lists };
     if (cached.user) state.user = cached.user;
     if (cached.partners) state.partners = cached.partners;
-    if (Array.isArray(cached.money)) state.money = cached.money;
+    if (Array.isArray(cached.money)) { state.money = cached.money; state.moneyStatus = 'ok'; }
     renderList();
     hideSplash(); // есть сохранённые данные — сразу к списку
     $('#list-note').textContent = 'Обновляю…';
