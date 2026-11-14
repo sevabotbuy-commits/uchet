@@ -6,6 +6,27 @@
 
 const tg = window.Telegram && window.Telegram.WebApp;
 const DEMO = new URLSearchParams(location.search).has('demo');
+// Версия этого файла — из адреса скрипта (app.js?v=21). Нужна для самообновления.
+const APP_VERSION = (() => { try { const m = /[?&]v=(\d+)/.exec(document.currentScript.src); return m ? Number(m[1]) : 0; } catch (e) { return 0; } })();
+
+/**
+ * Самообновление: Telegram держит старую страницу в памяти. При открытии сверяемся с сайтом (мимо кеша);
+ * если там версия новее — перезагружаемся на неё (один раз на версию, данные Telegram в адресе сохраняются).
+ */
+async function checkForUpdate() {
+  if (!APP_VERSION || location.protocol === 'file:') return;
+  try {
+    const res = await fetch('index.html?nc=' + Date.now(), { cache: 'no-store' });
+    const m = /app\.js\?v=(\d+)/.exec(await res.text());
+    const latest = m ? Number(m[1]) : 0;
+    if (latest <= APP_VERSION) return;
+    const key = 'uv.updated.' + latest;
+    try { if (sessionStorage.getItem(key)) return; sessionStorage.setItem(key, '1'); } catch (e) { /* без хранилища — всё равно один раз */ }
+    const q = new URLSearchParams(location.search);
+    q.set('u', String(latest));
+    location.replace(location.pathname + '?' + q.toString() + location.hash);
+  } catch (e) { /* нет сети — работаем на текущей версии */ }
+}
 const STATUS = { inTransit: 'В пути', inStock: 'В наличии', reserved: 'Бронь', sold: 'Продано' };
 const TABS = [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold, 'Все'];
 const STALE_DAYS = 60;          // «долго лежит»
@@ -3026,6 +3047,7 @@ function showFatal(message) {
 
 async function init() {
   setTimeout(hideSplash, 8000);
+  checkForUpdate();
   if (tg && tg.initData) {
     document.documentElement.classList.add('tg');
     if (tg.colorScheme === 'dark') document.documentElement.classList.add('tg-dark');
