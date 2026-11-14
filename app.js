@@ -347,7 +347,7 @@ function saveCache() {
 }
 /** Записать кеш, не помечая данные изменёнными (для фоновых загрузок). */
 function persistCache() {
-  storage.set(CACHE_KEY, { items: state.items, lists: state.lists, user: state.user, partners: state.partners, money: state.money, at: state.lastLoad });
+  storage.set(CACHE_KEY, { items: state.items, lists: state.lists, user: state.user, partners: state.partners, money: state.money, backup: state.backup, at: state.lastLoad });
 }
 
 async function loadItems({ silent = false, force = false } = {}) {
@@ -2151,7 +2151,7 @@ function renderStats() {
   $('#stats-journal').hidden = state.statsTab !== 'journal';
   syncNav();
   if (state.statsTab === 'partners') { renderPartners(); if (state.moneyStatus !== 'loading') loadMoney(); }
-  else if (state.statsTab === 'journal') loadHistory();
+  else if (state.statsTab === 'journal') { renderBackup(); loadHistory(); }
   else renderGeneralStats();
 }
 
@@ -2544,6 +2544,38 @@ function timeAgo(at) {
 }
 
 /** Последние изменения из листа «Журнал» — грузим при открытии статистики. */
+/** Архив раз в неделю: кнопка «Присылать мне» / «Прислать сейчас». Получатель — один. */
+function renderBackup() {
+  const box = $('#backup-box');
+  if (!box) return;
+  const b = state.backup;
+  if (!b) { box.hidden = true; return; }
+  box.hidden = false;
+  const busy = (btn, text) => { btn.disabled = true; btn.textContent = text; };
+  if (b.mine) {
+    const btn = el('button', { type: 'button', class: 'primary', onclick: async () => {
+      busy(btn, 'Собираю архив…');
+      try { await api('backupNow'); toast('Архив отправлен в чат с ботом ✓'); } catch (e) { toast(e.message); }
+      btn.disabled = false; btn.textContent = 'Прислать сейчас';
+    } }, 'Прислать сейчас');
+    box.replaceChildren(el('b', {}, '🗄 Архив приходит вам'), el('p', {}, `Бот присылает файл со всеми данными ${b.when}: вещи, журнал, деньги и полную копию для восстановления.`), el('div', { class: 'notice-actions' }, btn));
+  } else if (b.set) {
+    box.replaceChildren(el('b', {}, '🗄 Архив раз в неделю'), el('p', {}, 'Архив получает другой участник.'));
+  } else {
+    const btn = el('button', { type: 'button', class: 'primary', onclick: async () => {
+      if (!(await ask('Присылать архив всех данных вам в чат с ботом раз в неделю? Получатель может быть только один.'))) return;
+      busy(btn, 'Подключаю…');
+      try {
+        const r = await api('backupMe');
+        state.backup = r.backup; persistCache();
+        toast(r.sent ? 'Готово: первый архив уже в чате с ботом ✓' : 'Подключено, но отправить не вышло: ' + r.error);
+      } catch (e) { toast(e.message); }
+      renderBackup();
+    } }, 'Присылать мне');
+    box.replaceChildren(el('b', {}, '🗄 Архив раз в неделю'), el('p', {}, `Бот будет присылать ${'по воскресеньям в 22:00'} файл со всеми данными приложения — только вам.`), el('div', { class: 'notice-actions' }, btn));
+  }
+}
+
 async function loadHistory() {
   const box = $('#stats-history');
   if (!box.querySelector('.history-row')) {
@@ -2777,10 +2809,12 @@ async function demoApi(action, p) {
   const num = (v) => (v === '' || v === undefined || v === null ? null : Number(v));
   const touch = (it) => { it.changedBy = 'Демо'; it.changedAt = demoDb.stamp() + '.' + Math.random().toString().slice(2, 5); };
   switch (action) {
-    case 'meta': return { user: { id: 0, name: 'Антон' }, partners: ['Антон', 'Дима'], lists: { ...DEFAULT_LISTS, category: ['Куртки', 'Худи', 'Обувь', 'Сумки', 'Аксессуары', 'Футболки'] } };
+    case 'meta': return { backup: { set: Boolean(demoDb.backup), mine: Boolean(demoDb.backup), when: 'по воскресеньям в 22:00' }, user: { id: 0, name: 'Антон' }, partners: ['Антон', 'Дима'], lists: { ...DEFAULT_LISTS, category: ['Куртки', 'Худи', 'Обувь', 'Сумки', 'Аксессуары', 'Футболки'] } };
     case 'list': return JSON.parse(JSON.stringify(demoDb.items));
     case 'history': return demoLog.slice().reverse().slice(0, 50);
     case 'money': return JSON.parse(JSON.stringify(demoDb.money));
+    case 'backupMe': demoDb.backup = true; return { sent: true, backup: { set: true, mine: true, when: 'по воскресеньям в 22:00' } };
+    case 'backupNow': return { sent: true };
     case 'moneyAdd': {
       const nid = () => Math.random().toString(16).slice(2, 10);
       const date = isoToRu(p.date || todayIso());
@@ -3022,6 +3056,7 @@ async function init() {
     if (cached.lists) state.lists = { ...DEFAULT_LISTS, ...cached.lists };
     if (cached.user) state.user = cached.user;
     if (cached.partners) state.partners = cached.partners;
+    if (cached.backup) state.backup = cached.backup;
     if (Array.isArray(cached.money)) { state.money = cached.money; state.moneyStatus = 'ok'; }
     renderList();
     hideSplash(); // есть сохранённые данные — сразу к списку
@@ -3032,6 +3067,7 @@ async function init() {
     state.lists = { ...DEFAULT_LISTS, ...meta.lists };
     state.user = meta.user || null;
     state.partners = meta.partners || [];
+    state.backup = meta.backup || null;
     saveCache();
     renderList();
     hideSplash();

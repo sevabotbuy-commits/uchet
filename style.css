@@ -704,3 +704,5 @@ body:has(.sheet:not([hidden])) .toast { bottom: auto; top: calc(12px + env(safe-
 .how summary::after { content: "›"; margin-left: 6px; transition: transform .2s ease; }
 .how[open] summary::after { transform: rotate(90deg); }
 .how p { margin: 0 0 8px; line-height: 1.45; }
+
+.backup-box { margin-bottom: 14px; }
