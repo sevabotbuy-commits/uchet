@@ -2568,17 +2568,7 @@ function renderPartners() {
       noSoldByItems, el('button', { type: 'button', class: 'primary', onclick: () => fillSoldBy(noSoldByItems) }, `Указать (${noSoldByItems.length})`)) : null].filter(Boolean));
   void unknown;
 
-  const s = settlement();
-  const settle = $('#partner-settle');
-  const who = (n) => (n === COMMON ? 'Общие' : n);
-  const head = s.transfers.length
-    ? [el('div', { class: 'muted' }, 'Деньги за проданные вещи получил не владелец — нужно передать:'),
-      ...s.transfers.map((t) => el('div', { class: 'settle-transfer' },
-        el('b', {}, who(t.from)), el('span', { class: 'arrow' }, ' → '), el('b', {}, who(t.to)), el('div', { class: 'settle-amount' }, rub(t.amount)),
-        el('button', { type: 'button', class: 'link-btn settle-pay', onclick: () => openMoney('transfer', { from: t.from, to: t.to, amount: t.amount, note: 'Погашение долга за проданные вещи' }) }, 'Отметить перевод')))]
-    : [el('div', { class: 'settle-transfer' }, el('b', {}, 'Никто никому не должен ✓'))];
-  settle.replaceChildren(el('div', { class: 'settle-card' }, ...head,
-    s.skipped ? el('p', { class: 'muted' }, `Не учтено продаж без «Кто платил» или «Деньги получил»: ${s.skipped}.`) : null));
+  // Раздел «Кто кому должен» убран с экрана (по просьбе владельца).
 }
 
 /** «5 мин назад» из «10.11.2026 14:05:00». */
