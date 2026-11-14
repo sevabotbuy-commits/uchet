@@ -45,6 +45,7 @@ const state = {
   navIds: [],
   select: null,       // режим выделения: Set выбранных id или null
   layout: 'grid',
+  owner: '',          // отбор «вещи, которые оплатил …» (кошелёк) или ''
   money: [],          // журнал денег: пополнения, выводы, переводы
   moneyStatus: 'idle', // idle | loading | ok | error — чтобы при сбое не показывать «нули» как правду     // вид склада: 'grid' — плитка с крупными фото, 'list' — строки
 };
@@ -279,7 +280,7 @@ function show(view, { push = true } = {}) {
     animateView($('#view-' + view), back ? 'enter-back' : 'enter-forward');
     if (view === 'list') updateStuck(); // вернулись на прокрученный список — тень панели сразу
   }
-  if (tg && tg.BackButton) { if (view === 'list') tg.BackButton.hide(); else tg.BackButton.show(); }
+  if (tg && tg.BackButton) { if (view === 'list' && !(state.owner && state.ownerFrom)) tg.BackButton.hide(); else tg.BackButton.show(); }
   setClosingGuard(view === 'form' && state.form.dirty);
   syncMainButton();
 }
@@ -318,10 +319,20 @@ async function goBack() {
   if (!$('#picker-sheet').hidden) { $('#picker-sheet').hidden = true; return; }
   if (!$('#money-sheet').hidden) { $('#money-sheet').hidden = true; return; }
   if (state.select && state.view === 'list') { exitSelect(); return; }
+  if (state.view === 'list' && state.owner && state.ownerFrom) {
+    const tab = state.ownerFrom;
+    state.owner = ''; state.ownerFrom = '';
+    renderList();
+    state.statsTab = tab;
+    show('stats', { push: false });
+    renderStats();
+    return;
+  }
   if (state.view === 'form' && state.form.dirty && state.form.mode === 'edit') {
     if (!(await ask('Выйти без сохранения изменений?'))) return;
   }
   const prev = state.stack.pop() || 'list';
+  if (state.view === 'list' && prev !== 'list') state.owner = ''; // вернулись из отбора по человеку
   if (prev === 'item' && state.current) openItem(state.current.id, { push: false });
   else if (prev === 'stats') { show('stats', { push: false }); renderStats(); }
   else { renderList(); show(prev, { push: false }); }
@@ -636,6 +647,7 @@ function filtered() {
     .map((i, idx) => Object.assign({}, i, { _idx: idx }))
     .filter((i) => {
       if (state.tab !== 'Все' && i.status !== state.tab) return false;
+      if (state.owner && ownerOf(i) !== state.owner) return false;
       if (state.category && i.category !== state.category) return false;
       if (!words.length) return true;
       const hay = [i.title, i.brand, i.size, i.category, i.notes, i.id, i.consignor, i.seller, i.buyer, i.soldBy]
@@ -1039,7 +1051,39 @@ function flushPendingDeletes() {
   [...pendingDeletes.values()].forEach((commit) => commit());
 }
 
+/** Плашка «Оплатил: Сева · 12 шт. на 1,2 млн ₽ ×» над списком. */
+function renderOwnerFilter() {
+  const box = $('#owner-filter');
+  if (!state.owner) { box.hidden = true; return; }
+  const mine = state.items.filter((i) => ownerOf(i) === state.owner);
+  const sum = mine.filter((i) => i.status !== STATUS.sold).reduce((a, i) => a + (isNum(i.buyPrice) ? i.buyPrice : 0), 0);
+  box.hidden = false;
+  box.replaceChildren(
+    el('div', { class: 'owner-filter-text' },
+      el('b', {}, `Оплатил: ${walletLabel(state.owner)}`),
+      el('span', {}, `${pieces(mine.length)} · в одежде ${rub(sum)}`)),
+    el('button', { type: 'button', class: 'owner-filter-x', 'aria-label': 'Показать все вещи', onclick: () => { state.owner = ''; state.ownerFrom = ''; haptic('tap'); renderList(); if (tg && tg.BackButton && state.view === 'list') { try { tg.BackButton.hide(); } catch (e) { /* нет */ } } } }, '×'));
+}
+
+/** Нажали на имя в «Деньгах»/«По людям» — склад с вещами, которые оплатил этот человек. */
+function openOwner(name) {
+  state.owner = name;
+  state.tab = 'Все';
+  state.category = '';
+  state.query = '';
+  $('#search').value = '';
+  $('#search-clear').hidden = true;
+  haptic('tap');
+  state.ownerFrom = state.view === 'stats' ? state.statsTab : '';
+  show('list');
+  window.scrollTo(0, 0);
+  renderList();
+  // «Назад» (и кнопка Telegram) вернёт туда, откуда пришли
+  if (state.ownerFrom && tg && tg.BackButton) { try { tg.BackButton.show(); } catch (e) { /* нет */ } }
+}
+
 function renderList() {
+  renderOwnerFilter();
   renderTabs();
   renderChips();
   renderSummary();
@@ -1058,7 +1102,7 @@ function renderList() {
       [STATUS.reserved]: ['Броней нет', 'Отложить вещь для покупателя — «В бронь» в её карточке.'],
       [STATUS.sold]: ['Продаж пока нет', 'Отметьте продажу кнопкой «Продано» в карточке вещи.'],
     };
-    const filteredOut = state.query || state.category;
+    const filteredOut = state.query || state.category || state.owner;
     const [title, text] = !state.items.length ? ['Вещей пока нет', 'Начните с первой — фото, название и цена закупа.']
       : filteredOut ? ['Ничего не найдено', state.query ? `По запросу «${state.query.trim()}» в этой вкладке ничего нет.` : 'В этой категории здесь ничего нет.']
         : (TAB_HINTS[state.tab] || ['Пусто', '']);
@@ -1085,6 +1129,7 @@ function renderList() {
 function resetFilters() {
   state.query = '';
   state.category = '';
+  state.owner = '';
   $('#search').value = '';
   renderList();
 }
@@ -2123,6 +2168,7 @@ function syncNav() {
 function navTo(target) {
   haptic('tap');
   if (target === 'list') {
+    if (state.owner) { state.owner = ''; renderList(); }
     if (state.view === 'list') { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
     state.stack = [];
     renderList();
@@ -2365,7 +2411,7 @@ function renderMoney() {
   const m = moneyByWallet();
   box.classList.toggle('odd', m.wallets.length % 2 === 1);
   box.replaceChildren(...m.wallets.map((w) => el('div', { class: 'money-card' + (w.name === COMMON ? ' common' : '') },
-    el('div', { class: 'money-name' }, w.name === COMMON ? '🏦 Общие' : '👤 ' + w.name),
+    el('button', { type: 'button', class: 'money-name name-link', onclick: () => openOwner(w.name) }, w.name === COMMON ? '🏦 Общие' : '👤 ' + w.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
     el('div', { class: 'money-free-label' }, 'Свободные'),
     el('div', { class: 'money-free ' + (w.free < 0 ? 'profit-minus' : '') }, rub(w.free)),
     el('div', { class: 'money-row' }, el('span', {}, 'В одежде'), el('b', {}, rub(w.clothes)), el('small', {}, pieces(w.clothesCount))),
@@ -2486,7 +2532,7 @@ function renderPartners() {
     const isCommon = c.name === COMMON;
     const free = freeOf.get(c.name);
     return el('div', { class: 'partner-card' + (isCommon ? ' common' : '') },
-      el('div', { class: 'partner-name' }, isCommon ? '🏦 Общая касса' : c.name),
+      el('button', { type: 'button', class: 'partner-name name-link', onclick: () => openOwner(c.name) }, isCommon ? '🏦 Общая касса' : c.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
       isNum(free) ? el('div', { class: 'partner-free' }, el('span', {}, 'Свободные'), el('b', { class: free < 0 ? 'profit-minus' : '' }, rub(free))) : null,
       el('div', { class: 'partner-row' }, el('span', {}, 'Вложено'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
       el('div', { class: 'partner-row' }, el('span', {}, 'Продано'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),

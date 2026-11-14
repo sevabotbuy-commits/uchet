@@ -10,7 +10,7 @@
   <title>Учёт вещей</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <!-- ?v= — номер версии: меняйте при каждом обновлении, иначе Telegram покажет старые файлы из кеша -->
-  <link rel="stylesheet" href="style.css?v=17">
+  <link rel="stylesheet" href="style.css?v=18">
 </head>
 <body>
   <!-- Заставка с логотипом — пока загружаются данные -->
@@ -67,6 +67,7 @@
     <div id="cat-chips" class="chips"></div>
     </div>
     <!-- Панель списка: провести пальцем влево/вправо — соседняя вкладка -->
+    <div id="owner-filter" class="owner-filter" role="status" hidden></div>
     <div id="list-pane" class="list-pane">
       <p id="list-note" class="muted list-note" aria-live="polite"></p>
       <ul id="items" class="items"></ul>
@@ -303,7 +304,7 @@
 
   <div id="toast" class="toast" hidden role="status"></div>
 
-  <script src="config.js?v=17"></script>
-  <script src="app.js?v=17"></script>
+  <script src="config.js?v=18"></script>
+  <script src="app.js?v=18"></script>
 </body>
 </html>
