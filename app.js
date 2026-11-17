@@ -6,7 +6,7 @@
 
 const tg = window.Telegram && window.Telegram.WebApp;
 const DEMO = new URLSearchParams(location.search).has('demo');
-// Версия этого файла — из адреса скрипта (app.js?v=21). Нужна для самообновления.
+// Версия этого файла — из адреса скрипта (app.js?v=22). Нужна для самообновления.
 const APP_VERSION = (() => { try { const m = /[?&]v=(\d+)/.exec(document.currentScript.src); return m ? Number(m[1]) : 0; } catch (e) { return 0; } })();
 
 /**
@@ -27,8 +27,12 @@ async function checkForUpdate() {
     location.replace(location.pathname + '?' + q.toString() + location.hash);
   } catch (e) { /* нет сети — работаем на текущей версии */ }
 }
-const STATUS = { inTransit: 'В пути', inStock: 'В наличии', reserved: 'Бронь', sold: 'Продано' };
-const TABS = [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold, 'Все'];
+const STATUS = { idea: 'Можно купить', inTransit: 'В пути', inStock: 'В наличии', reserved: 'Бронь', sold: 'Продано' };
+// «Можно купить» — отдельная вкладка присмотренных вещей: в деньги, «Все», статистику и отчёты не входит.
+const TABS = [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold, 'Все', STATUS.idea];
+const isIdea = (i) => i.status === STATUS.idea;
+/** Вещи «в учёте» — без присмотренных. */
+const realItems = () => state.items.filter((i) => !isIdea(i));
 const STALE_DAYS = 60;          // «долго лежит»
 const AUTO_REFRESH_MS = 60000;  // при возврате в приложение обновлять, если данные старше минуты
 const CACHE_KEY = DEMO ? 'uv.demo.cache' : 'uv.cache';
@@ -38,7 +42,7 @@ const DEFAULT_LISTS = {
   condition: ['Новое с бирками', 'Отличное', 'Хорошее', 'Есть следы носки'],
   source: ['Выкуп', 'Комиссия'],
   authenticity: ['Не проверено', 'Проверено', 'Есть сомнения'],
-  status: [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold],
+  status: [STATUS.idea, STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold],
   country: ['США', 'Европа', 'Китай', 'Корея', 'Япония'],
 };
 
@@ -166,7 +170,7 @@ function daysHeld(item) {
   const to = item.status === STATUS.sold ? parseRuDate(item.saleDate) : new Date();
   return to ? Math.max(0, dayDiff(from, to)) : null;
 }
-const isStale = (item) => item.status !== STATUS.sold && (daysHeld(item) || 0) >= STALE_DAYS;
+const isStale = (item) => item.status !== STATUS.sold && !isIdea(item) && (daysHeld(item) || 0) >= STALE_DAYS;
 
 const storage = {
   get(key) { try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { return null; } },
@@ -450,7 +454,7 @@ const tabIndex = (t) => TABS.indexOf(t);
 function renderTabs() {
   const box = $('#status-tabs');
   box.replaceChildren(tabIndicator, ...TABS.map((t) => {
-    const n = t === 'Все' ? state.items.length : state.items.filter((i) => i.status === t).length;
+    const n = t === 'Все' ? realItems().length : state.items.filter((i) => i.status === t).length;
     return el('button', {
       type: 'button', role: 'tab', 'aria-selected': String(state.tab === t),
       onclick: () => switchTab(t),
@@ -592,7 +596,7 @@ function monthSales(offset = 0) {
 
 /** Подсказка на главном экране: сколько вещей без «Кто платил» (нужно для расчёта партнёров). */
 function renderBuyerHint() {
-  const ids = state.items.filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer && !isCommission(i)).map((i) => i.id);
+  const ids = realItems().filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer && !isCommission(i)).map((i) => i.id);
   const hint = $('#buyer-hint');
   hint.hidden = !ids.length || Boolean(state.select);
   if (!ids.length) return;
@@ -612,7 +616,7 @@ function shortRub(n, signed) {
 }
 
 function renderSummary() {
-  const unsold = state.items.filter((i) => i.status !== STATUS.sold);
+  const unsold = realItems().filter((i) => i.status !== STATUS.sold);
   const transit = unsold.filter((i) => i.status === STATUS.inTransit).length;
   const invested = unsold.reduce((s, i) => s + (i.buyPrice || 0), 0);
   const sold = monthSales();
@@ -668,6 +672,7 @@ function filtered() {
     .map((i, idx) => Object.assign({}, i, { _idx: idx }))
     .filter((i) => {
       if (state.tab !== 'Все' && i.status !== state.tab) return false;
+      if (state.tab === 'Все' && isIdea(i)) return false; // присмотренные — только в своей вкладке
       if (state.owner && ownerOf(i) !== state.owner) return false;
       if (state.category && i.category !== state.category) return false;
       if (!words.length) return true;
@@ -697,7 +702,7 @@ function itemRow(item, onClick, swipeable) {
     const c = commissionFrom(item, item.planPrice);
     sub = c !== null ? el('small', { class: 'muted-small' }, 'наши ' + nf.format(c)) : null;
   } else {
-    sub = isNum(item.buyPrice) ? el('small', { class: 'muted-small' }, 'закуп ' + nf.format(item.buyPrice)) : null;
+    sub = isNum(item.buyPrice) ? el('small', { class: 'muted-small' }, (isIdea(item) ? 'просят ' : 'закуп ') + nf.format(item.buyPrice)) : null;
   }
   const flag = COUNTRY_FLAGS[item.country] ? COUNTRY_FLAGS[item.country] + ' ' : '';
   const price = rub(item.status === STATUS.sold ? item.salePrice : item.planPrice);
@@ -1118,6 +1123,7 @@ function renderList() {
     note.textContent = '';
     // Пустая вкладка — объясняем, что здесь бывает и как сюда попасть
     const TAB_HINTS = {
+      [STATUS.idea]: ['Пока ничего не присмотрели', 'Добавляйте сюда вещи, которые можно купить: фото, сколько просят и где, за сколько продадим. В деньги и статистику они не входят, пока не нажмёте «Купили».'],
       [STATUS.inTransit]: ['Ничего не едет', 'Здесь вещи, которые оплачены, но ещё в пути. При добавлении выберите статус «В пути».'],
       [STATUS.inStock]: ['В наличии пусто', 'Добавьте вещь или отметьте «Получена» у той, что в пути.'],
       [STATUS.reserved]: ['Броней нет', 'Отложить вещь для покупателя — «В бронь» в её карточке.'],
@@ -1465,7 +1471,7 @@ const ITEM_FIELDS = [
   ['changedAt', 'Изменено'], ['id', 'ID'],
 ];
 const STATUS_CLASS = {
-  [STATUS.inTransit]: 's-transit', [STATUS.inStock]: 's-instock', [STATUS.reserved]: 's-reserved', [STATUS.sold]: 's-sold',
+  [STATUS.idea]: 's-idea', [STATUS.inTransit]: 's-transit', [STATUS.inStock]: 's-instock', [STATUS.reserved]: 's-reserved', [STATUS.sold]: 's-sold',
 };
 
 function openItem(id, opts) {
@@ -1556,6 +1562,9 @@ function openItem(id, opts) {
 
   const actions = [];
   const btn = (text, onclick, cls) => el('button', { type: 'button', class: cls, onclick }, text);
+  if (isIdea(item)) {
+    actions.push(btn('Купили — едет', () => markBought(STATUS.inTransit), 'primary'), btn('Купили — у нас', () => markBought(STATUS.inStock)));
+  }
   if (item.status === STATUS.inTransit) {
     // Главное действие для едущей вещи — отметить получение; продать/забронировать можно и заранее.
     actions.push(btn('Получена', () => changeStatus(STATUS.inStock), 'primary wide-row'));
@@ -1663,6 +1672,19 @@ async function optimistic(stale, patch, call, okMessage, undoTo) {
   }
 }
 
+/** Присмотренную вещь купили: кто платил → статус «В пути»/«В наличии», дата закупа — сегодня. */
+function markBought(status) {
+  const item = state.current;
+  openPicker(`Кто платил за «${item.title}»`, walletList().map((p) => [p, walletLabel(p)]), (name) => {
+    rememberWallet(name);
+    const version = item.changedAt;
+    const patch = { status, buyer: name, buyDate: isoToRu(todayIso()) };
+    optimistic(item, patch, () => api('update', { id: item.id, version, status, buyer: name, buyDate: todayIso() }),
+      `Купили ✓ — теперь «${status}»`);
+    state.tab = status;
+  });
+}
+
 /** Выбрать «Кто платил» прямо из карточки. */
 function pickBuyer(item) {
   openPicker('Кто платил за «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), (name) => {
@@ -1713,7 +1735,7 @@ function reportText() {
   const sold = monthSales(0);
   const revenue = sold.reduce((s, i) => s + (i.salePrice || 0), 0);
   const profit = sold.reduce((s, i) => s + (profitOf(i) || 0), 0);
-  const unsold = state.items.filter((i) => i.status !== STATUS.sold);
+  const unsold = realItems().filter((i) => i.status !== STATUS.sold);
   const transit = unsold.filter((i) => i.status === STATUS.inTransit).length;
   const invested = unsold.reduce((s, i) => s + (i.buyPrice || 0), 0);
   const lines = [`📊 Учёт вещей — ${MONTHS_FULL[now.getMonth()].toLowerCase()} ${now.getFullYear()}`, ''];
@@ -1952,7 +1974,7 @@ function openForm(mode, source) {
     if (!f.authenticity.value && state.lists.authenticity.includes('Не проверено')) f.authenticity.value = 'Не проверено';
     if (!f.category.value && state.category) f.category.value = state.category;
     if (!f.buyer.value) setField(f, 'buyer', lastWallet());
-    f.status.value = state.tab === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock;
+    f.status.value = state.tab === STATUS.inTransit || state.tab === STATUS.idea ? state.tab : STATUS.inStock;
   }
   syncFormExtras();
   show('form');
@@ -2279,7 +2301,7 @@ function moneyByWallet() {
   const ev = [];
   const t = (ru, dflt) => { const d = parseRuDate(ru); return d ? d.getTime() : dflt; };
   state.money.forEach((m) => { const r = get(m.wallet); if (r) ev.push({ r, at: t(m.date, 0), order: 0, amount: m.amount, op: true }); });
-  state.items.forEach((i) => {
+  realItems().forEach((i) => {
     if (!isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0) {
       const r = get(i.buyer);
       if (r) {
@@ -2360,7 +2382,7 @@ function partnerTotals(period) {
     return t.get(name);
   };
   walletList().forEach(get);
-  state.items.forEach((i) => {
+  realItems().forEach((i) => {
     const owner = ownerOf(i); // '' — не указано или имя не из списка
     if (isNum(i.buyPrice) && i.buyPrice > 0 && !isCommission(i)) {
       if (inPeriod(i.buyDate, period)) { const r = get(owner); r.buy += i.buyPrice; r.buyCount++; }
@@ -2570,7 +2592,7 @@ function renderPartners() {
 
   // Предупреждения: не указано, кто платил (закупка) / кто получил деньги (продажа) — это разные вещи
   const unk = $('#partner-unknown');
-  const noBuyerItems = state.items.filter((i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && !walletOf(i.buyer));
+  const noBuyerItems = realItems().filter((i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && !walletOf(i.buyer));
   const noSoldByItems = state.items.filter((i) => i.status === STATUS.sold && isNum(i.salePrice) && !walletOf(i.soldBy));
   const notice = (title, text, items, action) => {
     const list = el('ul', { class: 'items', hidden: true }, items.slice(0, 30).map((i) => itemRow(i)));
@@ -2628,7 +2650,7 @@ async function loadHistory() {
 }
 
 function renderGeneralStats() {
-  const onHand = state.items.filter((i) => i.status !== STATUS.sold);
+  const onHand = realItems().filter((i) => i.status !== STATUS.sold);
   const sold = state.items.filter((i) => i.status === STATUS.sold);
   const stockCost = onHand.reduce((s, i) => s + (i.buyPrice || 0), 0);
   const planSum = onHand.reduce((s, i) => s + (i.planPrice || 0), 0);
