@@ -1874,6 +1874,11 @@ const FUND_NEW = 'Новые деньги', FUND_CAP = 'Из капитала';
 const FUND_OPTIONS = [[FUND_NEW, '💵 Новые деньги'], [FUND_CAP, '🔄 Из капитала']];
 /** Закупка, у которой надо знать, откуда деньги: своя, с ценой, уже купленная. */
 const needsFund = (i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && i.status !== STATUS.idea;
+/**
+ * Закупка на новые деньги (не из свободных). Правило владельца: общие вещи куплены из общего бюджета,
+ * а не из выручки Арсения — поэтому общая закупка без отметки считается «Новые деньги».
+ */
+const isFresh = (i) => i.fundSource === FUND_NEW || (!i.fundSource && walletOf(i.buyer) === COMMON);
 
 const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'condition', 'country', 'source', 'authenticity', 'consignor',
   'commissionPct', 'buyPrice', 'buyDate', 'buyer', 'fundSource', 'seller', 'buyDoc', 'planPrice', 'notes'];
@@ -2326,7 +2331,7 @@ function moneyByWallet() {
     if (!isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0) {
       const r = get(i.buyer);
       if (r) {
-        ev.push({ r, at: t(i.buyDate, -Infinity), order: 1, amount: -i.buyPrice, buy: true, fresh: i.fundSource === FUND_NEW });
+        ev.push({ r, at: t(i.buyDate, -Infinity), order: 1, amount: -i.buyPrice, buy: true, fresh: isFresh(i) });
         r.buys += i.buyPrice;
         if (i.status !== STATUS.sold) {
           r.clothes += i.buyPrice; r.clothesCount++;
@@ -2627,7 +2632,7 @@ function renderPartners() {
   const unk = $('#partner-unknown');
   const noBuyerItems = realItems().filter((i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && !walletOf(i.buyer));
   const noSoldByItems = state.items.filter((i) => i.status === STATUS.sold && isNum(i.salePrice) && !payeeOf(i));
-  const noFundItems = realItems().filter((i) => needsFund(i) && !i.fundSource);
+  const noFundItems = realItems().filter((i) => needsFund(i) && !i.fundSource && walletOf(i.buyer) !== COMMON);
   const notice = (title, text, items, action) => {
     const list = el('ul', { class: 'items', hidden: true }, items.slice(0, 30).map((i) => itemRow(i)));
     return el('div', { class: 'notice' },
