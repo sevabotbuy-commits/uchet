@@ -598,7 +598,7 @@ function monthSales(offset = 0) {
 
 /** Подсказка на главном экране: сколько вещей без «Кто платил» (нужно для расчёта партнёров). */
 function renderBuyerHint() {
-  const ids = realItems().filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer && !isCommission(i)).map((i) => i.id);
+  const ids = realItems().filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !walletOf(i.buyer) && !isCommission(i)).map((i) => i.id);
   const hint = $('#buyer-hint');
   hint.hidden = !ids.length || Boolean(state.select);
   if (!ids.length) return;
@@ -892,7 +892,9 @@ function bulkPick(field) {
 /** Массовое изменение: сразу на экране, сервер в фоне, при ошибке — откат. */
 async function applyBulk(field, value) {
   const ids = [...state.select];
-  const targets = state.items.filter((i) => ids.includes(i.id) && !(field === 'status' && i.status === STATUS.sold));
+  // Статус массово не трогает проданные и «Можно купить» (иначе присмотренная вещь станет «купленной» без «Кто платил»)
+  const targets = state.items.filter((i) => ids.includes(i.id) && !(field === 'status' && (i.status === STATUS.sold || isIdea(i))));
+  if (!targets.length) { exitSelect(); toast('Ничего не изменено: проданные и «Можно купить» массово не меняются'); return; }
   const before = targets.map((i) => ({ ...i }));
   targets.forEach((i) => {
     i[field] = value;
@@ -904,9 +906,9 @@ async function applyBulk(field, value) {
   exitSelect();
   haptic('success');
   toast(`${BULK_LABELS[field]}: ${value || 'не указано'} — ${pieces(targets.length)}`
-    + (skipped ? ` (проданные не тронуты: ${skipped})` : ''));
+    + (skipped ? ` (проданные и «Можно купить» не тронуты: ${skipped})` : ''));
   try {
-    await api('bulkUpdate', { ids, patch: { [field]: value } });
+    await api('bulkUpdate', { ids: targets.map((i) => i.id), patch: { [field]: value } });
     state.pending--;
     if (!state.pending) loadItems({ silent: true }).catch(() => {}); // запись уже прошла — сбой обновления не откатывает её
   } catch (e) {
@@ -929,32 +931,30 @@ function fillSoldBy(items) {
       const item = state.items.find((i) => i.id === stale.id);
       if (!item) continue;
       const version = item.changedAt;
+      const prev = { soldBy: item.soldBy, buyer: item.buyer };
+      // Выбранный бюджет — это и «Кто платил»: закупка и выручка попадают в один бюджет
+      const setBuyer = !walletOf(item.buyer) && !isCommission(item);
       item.soldBy = name;
+      if (setBuyer) item.buyer = name;
       try {
-        const res = await api('update', { id: item.id, version, soldBy: name });
+        const res = await api('update', { id: item.id, version, soldBy: name, ...(setBuyer ? { buyer: name } : {}) });
         if (res && res.version) item.changedAt = res.version;
-      } catch (e) { failed++; item.soldBy = ''; }
+      } catch (e) { failed++; Object.assign(item, prev); }
     }
     state.pending--;
     saveCache();
     if (state.view === 'stats') renderStats();
-    toast(failed ? `Не удалось: ${failed}. Обновите и попробуйте ещё раз.` : `Деньги получил: ${walletLabel(name)} ✓`);
+    toast(failed ? `Не удалось: ${failed}. Обновите и попробуйте ещё раз.` : `Бюджет: ${walletLabel(name)} ✓`);
     if (failed) loadItems({ silent: true, force: true }).catch(() => {});
   });
 }
 
+/** «Указать разом»: сразу спросить «Кто платил» для этих вещей — без режима выделения (там не видно проданных). */
 function bulkFillBuyer(ids) {
-  state.tab = 'Все';
-  state.category = '';
-  state.query = '';
-  $('#search').value = '';
-  $('#search-clear').hidden = true;
-  show('list');
-  enterSelect();
-  ids.forEach((id) => state.select.add(id));
-  renderList();
-  syncSelectBar();
-  bulkPick('buyer');
+  openPicker(`Кто платил — для ${pieces(ids.length)}`, walletList().map((p) => [p, walletLabel(p)]), (value) => {
+    state.select = new Set(ids);
+    applyBulk('buyer', value);
+  });
 }
 
 async function bulkDelete() {
@@ -1083,8 +1083,8 @@ function flushPendingDeletes() {
 function renderOwnerFilter() {
   const box = $('#owner-filter');
   if (!state.owner) { box.hidden = true; return; }
-  const mine = state.items.filter((i) => ownerOf(i) === state.owner);
-  const sum = mine.filter((i) => i.status !== STATUS.sold).reduce((a, i) => a + (isNum(i.buyPrice) ? i.buyPrice : 0), 0);
+  const mine = state.items.filter((i) => ownerOf(i) === state.owner && inAllTab(i)); // как в списке: без проданных и «Можно купить»
+  const sum = mine.reduce((a, i) => a + (isNum(i.buyPrice) ? i.buyPrice : 0), 0);
   box.hidden = false;
   box.replaceChildren(
     el('div', { class: 'owner-filter-text' },
@@ -1533,7 +1533,7 @@ function openItem(id, opts) {
     if (item.consignor) sub.push('комитент ' + item.consignor);
     if (isNum(item.commissionPct)) sub.push(`комиссия ${item.commissionPct}%`);
   } else if (isNum(item.buyPrice)) sub.push('закуп ' + rub(item.buyPrice));
-  if (!isCommission(item) && item.buyer) sub.push(item.buyer === COMMON ? 'из общей кассы' : 'платил ' + item.buyer);
+  if (!isCommission(item) && item.buyer) sub.push(item.buyer === COMMON ? 'платили Общие' : 'платил ' + item.buyer);
   if (item.status === STATUS.sold && item.saleDate) sub.push('продано ' + item.saleDate);
   const subBox = $('#item-subprice');
   subBox.replaceChildren(sub.join(' · '));
@@ -1638,6 +1638,10 @@ const discounted = (price) => Math.floor((price * 0.9) / 100) * 100;
  * «Сразу показать, сохранить в фоне»: изменение видно мгновенно, сервер (1–2 с) догоняет.
  * Если сервер откажет — возвращаем как было и показываем причину.
  */
+/** Записи одной вещи идут по очереди: следующая ждёт новую версию от предыдущей (иначе «Вещь только что изменили»). */
+const writeChains = new Map();
+
+/** call(version) получает актуальную версию вещи — в момент отправки, после предыдущей записи этой вещи. */
 async function optimistic(stale, patch, call, okMessage, undoTo) {
   const item = state.items.find((i) => i.id === stale.id) || stale; // актуальный объект из списка
   const before = { ...item };
@@ -1656,11 +1660,16 @@ async function optimistic(stale, patch, call, okMessage, undoTo) {
       if (!(await saved)) return; // сохранение не прошло — откатилось само
       const live = state.items.find((i) => i.id === item.id) || item;
       optimistic(live, { status: undoTo, salePrice: null, saleDate: '', soldBy: '' },
-        () => api('setStatus', { id: live.id, status: undoTo, version: live.changedAt }), `Отменено — снова «${undoTo}»`);
+        (v) => api('setStatus', { id: live.id, status: undoTo, version: v }), `Отменено — снова «${undoTo}»`);
     },
   } : undefined);
+  const prev = writeChains.get(item.id) || Promise.resolve();
+  const run = prev.then(() => call(item.changedAt));
+  const chain = run.catch(() => {});
+  writeChains.set(item.id, chain);
+  chain.then(() => { if (writeChains.get(item.id) === chain) writeChains.delete(item.id); });
   try {
-    const res = await call();
+    const res = await run;
     // Сервер вернул новую версию — следующее действие с вещью пройдёт без перезагрузки списка
     if (res && res.version) item.changedAt = res.version;
     state.pending--;
@@ -1669,8 +1678,9 @@ async function optimistic(stale, patch, call, okMessage, undoTo) {
   } catch (e) {
     state.pending--;
     resolveSaved(false);
+    const version = item.changedAt; // версию, полученную от предыдущих записей, не откатываем
     Object.keys(item).forEach((k) => { delete item[k]; });
-    Object.assign(item, before);
+    Object.assign(item, before, { changedAt: version });
     saveCache();
     refreshCurrentView();
     handleWriteError(e);
@@ -1682,9 +1692,8 @@ function markBought(status) {
   const item = state.current;
   openPicker(`Кто платил за «${item.title}»`, walletList().map((p) => [p, walletLabel(p)]), (name) => {
     rememberWallet(name);
-    const version = item.changedAt;
     const patch = { status, buyer: name, buyDate: isoToRu(todayIso()) };
-    optimistic(item, patch, () => api('update', { id: item.id, version, status, buyer: name, buyDate: todayIso() }),
+    optimistic(item, patch, (v) => api('update', { id: item.id, version: v, status, buyer: name, buyDate: todayIso() }),
       `Купили ✓ — теперь «${status}»`);
     state.tab = status;
   });
@@ -1693,8 +1702,7 @@ function markBought(status) {
 /** Выбрать «Кто платил» прямо из карточки. */
 function pickBuyer(item) {
   openPicker('Кто платил за «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), (name) => {
-    const version = item.changedAt;
-    optimistic(item, { buyer: name }, () => api('update', { id: item.id, version, buyer: name }), `Кто платил: ${name}`);
+    optimistic(item, { buyer: name }, (v) => api('update', { id: item.id, version: v, buyer: name }), `Кто платил: ${name}`);
   });
 }
 
@@ -1703,17 +1711,15 @@ async function discount10() {
   const next = discounted(item.planPrice);
   const margin = isNum(item.buyPrice) ? ` Наценка станет ${signedRub(next - item.buyPrice)}.` : '';
   if (!(await ask(`Снизить плановую цену с ${rub(item.planPrice)} до ${rub(next)}?${margin}`))) return;
-  const version = item.changedAt;
-  optimistic(item, { planPrice: next }, () => api('update', { id: item.id, version, planPrice: next }), `Новая цена: ${rub(next)}`);
+  optimistic(item, { planPrice: next }, (v) => api('update', { id: item.id, version: v, planPrice: next }), `Новая цена: ${rub(next)}`);
 }
 
 async function changeStatus(status) {
   const item = state.current;
   if (item.status === STATUS.sold && !(await ask('Вернуть вещь в наличие? Цена и дата продажи сотрутся.'))) return;
-  const version = item.changedAt;
   const msg = item.status === STATUS.inTransit && status === STATUS.inStock ? 'Получена — теперь в наличии ✓' : `Статус: ${status}`;
   optimistic(item, { status, salePrice: null, saleDate: '', soldBy: '' },
-    () => api('setStatus', { id: item.id, status, version }), msg, item.status);
+    (v) => api('setStatus', { id: item.id, status, version: v }), msg, item.status);
 }
 
 /** Скопировать текст и в Telegram предложить переслать его в любой чат. */
@@ -1860,7 +1866,7 @@ async function submitSell(e) {
   closeSheet();
   optimistic(item, {
     status: STATUS.sold, salePrice: payload.salePrice, saleDate: isoToRu(payload.saleDate), soldBy: payload.soldBy,
-  }, () => api('sell', payload), 'Продано ✓', item.status);
+  }, (v) => api('sell', { ...payload, version: v }), 'Продано ✓', item.status);
 }
 
 // ---------------------------------------------------------------- форма (добавить / изменить)
@@ -1875,7 +1881,7 @@ const BUY_ONLY_FIELDS = ['buyPrice', 'buyer', 'seller'];
 const myName = () => (state.user && state.user.name) || '';
 /** Общие деньги (касса) — третий «кошелёк» наряду с личными деньгами партнёров. */
 const COMMON = 'Общие';
-const walletLabel = (n) => (n === COMMON ? 'Общая касса' : n);
+const walletLabel = (n) => n;
 const DEFAULT_PARTNERS = ['Арсений', 'Сева'];
 /** Люди, за чьи деньги покупаются вещи. Фиксированный список (с сервера), не зависит от того, кто открыл бота. */
 function partnerList() {
@@ -1944,10 +1950,10 @@ function openForm(mode, source) {
   $('#btn-delete').hidden = mode !== 'edit';
   $('#form-title').textContent = mode === 'edit' ? 'Изменить вещь' : 'Новая вещь';
   setFormPhoto(null);
-  // Статус: при добавлении — только «В наличии» или «В пути», при правке — все.
+  // Статус: при добавлении — «В наличии», «В пути» или «Можно купить», при правке — все.
   const statuses = mode === 'edit'
     ? [...new Set([...DEFAULT_LISTS.status, ...(state.lists.status || [])])]
-    : [STATUS.inStock, STATUS.inTransit];
+    : [STATUS.inStock, STATUS.inTransit, STATUS.idea];
   f.status.replaceChildren(...statuses.map((s) => el('option', { value: s }, s)));
 
   if (mode === 'edit') {
@@ -1981,6 +1987,7 @@ function openForm(mode, source) {
     if (!f.category.value && state.category) f.category.value = state.category;
     if (!f.buyer.value) setField(f, 'buyer', lastWallet());
     f.status.value = state.tab === STATUS.inTransit || state.tab === STATUS.idea ? state.tab : STATUS.inStock;
+    if (f.status.value === STATUS.idea) setField(f, 'buyer', ''); // присмотренную ещё не купили — платить некому
   }
   syncFormExtras();
   show('form');
@@ -2134,7 +2141,8 @@ async function submitForm(e) {
       state.form.dirty = false;
       haptic('success');
       toast('Сохранено ✓');
-      await loadItems({ silent: true, force: true }); // force: показать сохранённое, даже если рядом ждёт удаление
+      // force: показать сохранённое, даже если рядом ждёт удаление. Сбой обновления — не ошибка сохранения.
+      await loadItems({ silent: true, force: true }).catch(() => toast('Сохранено ✓ Список обновится позже — потяните вниз'));
       openItem(item.id, { push: false });
       state.stack = ['list'];
     } else {
@@ -2144,12 +2152,13 @@ async function submitForm(e) {
       state.form.dirty = false;
       storage.del(DRAFT_KEY);
       haptic('success');
-      toast(data.status === STATUS.inTransit ? 'Добавлена во «В пути» ✓' : 'Вещь добавлена ✓');
-      state.tab = data.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock;
+      toast(data.status === STATUS.inTransit ? 'Добавлена во «В пути» ✓' : data.status === STATUS.idea ? 'Добавлена в «Можно купить» ✓' : 'Вещь добавлена ✓');
+      state.tab = data.status === STATUS.inTransit || data.status === STATUS.idea ? data.status : STATUS.inStock;
+      state.owner = ''; // новая вещь не должна спрятаться за отбором по человеку
       state.query = '';
       $('#search').value = '';
       show('list');
-      await loadItems({ silent: true, force: true }); // force: новая вещь видна сразу
+      await loadItems({ silent: true, force: true }).catch(() => toast('Вещь добавлена ✓ Список обновится позже — потяните вниз')); // force: новая вещь видна сразу
     }
   } catch (ex) {
     handleWriteError(ex, err);
@@ -2548,6 +2557,7 @@ function openMoney(kind, preset) {
   f.note.value = (preset && preset.note) || (preset && preset.capital ? 'Капитал' : '');
   $('#money-title').textContent = preset && preset.capital ? 'Внести капитал в «Общие»' : { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
   $('#money-wallet-label').firstChild.textContent = kind === 'transfer' ? 'Откуда' : 'Кошелёк';
+  $('#money-wallet-label').hidden = !!(preset && preset.capital); // капитал — всегда в «Общие»
   $('#money-to-label').hidden = kind !== 'transfer';
   $('#money-error').textContent = '';
   $('#money-sheet').hidden = false;
@@ -2599,7 +2609,7 @@ function renderPartners() {
     const isCommon = c.name === COMMON;
     const free = freeOf.get(c.name);
     return el('div', { class: 'partner-card' + (isCommon ? ' common' : '') },
-      el('button', { type: 'button', class: 'partner-name name-link', onclick: () => openOwner(c.name) }, isCommon ? '🏦 Общая касса' : c.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
+      el('button', { type: 'button', class: 'partner-name name-link', onclick: () => openOwner(c.name) }, isCommon ? '🏦 Общие' : c.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
       isNum(free) ? el('div', { class: 'partner-free' }, el('span', {}, 'Свободные'), el('b', { class: free < 0 ? 'profit-minus' : '' }, rub(free))) : null,
       el('div', { class: 'partner-row' }, el('span', {}, 'Вложено'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
       el('div', { class: 'partner-row' }, el('span', {}, 'Продано'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
@@ -2914,8 +2924,8 @@ async function demoApi(action, p) {
     case 'add': {
       const id = Math.random().toString(16).slice(2, 10);
       const it = { ...p, id, buyPrice: num(p.buyPrice), planPrice: num(p.planPrice), commissionPct: num(p.commissionPct),
-        buyDate: isoToRu(p.buyDate), status: p.status === STATUS.inTransit ? STATUS.inTransit : STATUS.inStock,
-        buyer: p.source === COMMISSION ? '' : (p.buyer || 'Антон'), hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
+        buyDate: isoToRu(p.buyDate), status: p.status === STATUS.inTransit || p.status === STATUS.idea ? p.status : STATUS.inStock,
+        buyer: p.source === COMMISSION ? '' : (p.buyer || (p.status === STATUS.idea ? '' : 'Антон')), hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
       if (p.photo) { demoDb.photos.set(id, p.photo); it.photoKey = 'demo-' + Date.now(); }
       delete it.photo;
       touch(it);
