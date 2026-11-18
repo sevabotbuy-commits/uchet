@@ -12,7 +12,7 @@
   <title>Учёт вещей</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <!-- ?v= — номер версии: меняйте при каждом обновлении, иначе Telegram покажет старые файлы из кеша -->
-  <link rel="stylesheet" href="style.css?v=25">
+  <link rel="stylesheet" href="style.css?v=26">
 </head>
 <body>
   <!-- Заставка с логотипом — пока загружаются данные -->
@@ -82,8 +82,7 @@
         <button id="select-all" class="link-btn" type="button">Выбрать все</button>
       </div>
       <div class="select-actions">
-        <button type="button" data-bulk="buyer">Кто платил</button>
-        <button type="button" data-bulk="fundSource">Откуда деньги</button>
+        <button type="button" data-bulk="buyer">Чей бюджет</button>
         <button type="button" data-bulk="status">Статус</button>
         <button type="button" data-bulk="country">Страна</button>
         <button type="button" data-bulk="delete" class="danger">Удалить</button>
@@ -154,10 +153,7 @@
         <label><span id="buydate-label">Дата закупа</span><input name="buyDate" type="date"></label>
       </div>
       <div class="row buy-only">
-        <label>Кто платил<select name="buyer" data-list="partners"></select></label>
-        <label>Откуда деньги<select name="fundSource"><option value="">— не указано</option><option value="Новые деньги">💵 Новые деньги</option><option value="Из капитала">🔄 Из капитала</option></select></label>
-      </div>
-      <div class="row buy-only">
+        <label>Чей бюджет<select name="buyer" data-list="partners"></select></label>
         <label>У кого куплено<input name="seller" autocomplete="off"></label>
       </div>
       <label><span id="buydoc-label">Документ закупа</span><input name="buyDoc" autocomplete="off" placeholder="договор, чек…"></label>
@@ -302,7 +298,7 @@
 
   <div id="toast" class="toast" hidden role="status"></div>
 
-  <script src="config.js?v=25"></script>
-  <script src="app.js?v=25"></script>
+  <script src="config.js?v=26"></script>
+  <script src="app.js?v=26"></script>
 </body>
 </html>
