@@ -33,8 +33,6 @@ const TABS = [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold, '�
 const isIdea = (i) => i.status === STATUS.idea;
 /** Вещи «в учёте» — без присмотренных. */
 const realItems = () => state.items.filter((i) => !isIdea(i));
-/** Вкладка «Все» — вещи в работе: без проданных (они только в «Продано») и без «Можно купить». */
-const inAllTab = (i) => !isIdea(i) && i.status !== STATUS.sold;
 const STALE_DAYS = 60;          // «долго лежит»
 const AUTO_REFRESH_MS = 60000;  // при возврате в приложение обновлять, если данные старше минуты
 const CACHE_KEY = DEMO ? 'uv.demo.cache' : 'uv.cache';
@@ -456,7 +454,7 @@ const tabIndex = (t) => TABS.indexOf(t);
 function renderTabs() {
   const box = $('#status-tabs');
   box.replaceChildren(tabIndicator, ...TABS.map((t) => {
-    const n = t === 'Все' ? state.items.filter(inAllTab).length : state.items.filter((i) => i.status === t).length;
+    const n = t === 'Все' ? realItems().length : state.items.filter((i) => i.status === t).length;
     return el('button', {
       type: 'button', role: 'tab', 'aria-selected': String(state.tab === t),
       onclick: () => switchTab(t),
@@ -575,7 +573,7 @@ function bindTabSwipe() {
 }
 
 function renderChips() {
-  const pool = state.tab === 'Все' ? state.items.filter(inAllTab) : state.items.filter((i) => i.status === state.tab);
+  const pool = state.tab === 'Все' ? state.items : state.items.filter((i) => i.status === state.tab);
   const cats = [...new Set(pool.map((i) => i.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ru'));
   // Выбранной категории нет в этой вкладке — сбрасываем выбор, а не показываем её с нулём
   if (state.category && !cats.includes(state.category)) state.category = '';
@@ -596,13 +594,13 @@ function monthSales(offset = 0) {
   });
 }
 
-/** Подсказка на главном экране: сколько вещей без «Чей бюджет» (нужно для расчёта партнёров). */
+/** Подсказка на главном экране: сколько вещей без «Кто платил» (нужно для расчёта партнёров). */
 function renderBuyerHint() {
   const ids = realItems().filter((i) => isNum(i.buyPrice) && i.buyPrice > 0 && !i.buyer && !isCommission(i)).map((i) => i.id);
   const hint = $('#buyer-hint');
   hint.hidden = !ids.length || Boolean(state.select);
   if (!ids.length) return;
-  hint.replaceChildren(el('span', {}, `${pieces(ids.length)} без «Чей бюджет»`), el('b', {}, 'Указать ›'));
+  hint.replaceChildren(el('span', {}, `${pieces(ids.length)} без «Кто платил»`), el('b', {}, 'Указать ›'));
   hint.onclick = () => bulkFillBuyer(ids);
 }
 
@@ -668,13 +666,13 @@ function searchVariants(word) {
   return out;
 }
 
-function filtered(tab = state.tab) {
+function filtered() {
   const words = state.query.trim().toLowerCase().split(/\s+/).filter(Boolean).map(searchVariants);
   return state.items
     .map((i, idx) => Object.assign({}, i, { _idx: idx }))
     .filter((i) => {
-      if (tab !== 'Все' && i.status !== tab) return false;
-      if (tab === 'Все' && !inAllTab(i)) return false; // проданные и присмотренные — только в своих вкладках
+      if (state.tab !== 'Все' && i.status !== state.tab) return false;
+      if (state.tab === 'Все' && isIdea(i)) return false; // присмотренные — только в своей вкладке
       if (state.owner && ownerOf(i) !== state.owner) return false;
       if (state.category && i.category !== state.category) return false;
       if (!words.length) return true;
@@ -875,7 +873,7 @@ function openPicker(title, options, onPick) {
   sheet.hidden = false;
 }
 
-const BULK_LABELS = { buyer: 'Чей бюджет', status: 'Статус', country: 'Страна', category: 'Категория' };
+const BULK_LABELS = { buyer: 'Кто платил', status: 'Статус', country: 'Страна', category: 'Категория' };
 
 function bulkPick(field) {
   const n = state.select ? state.select.size : 0;
@@ -918,7 +916,7 @@ async function applyBulk(field, value) {
   }
 }
 
-/** Из «Партнёры»: открыть список, выделить вещи без «Чей бюджет» и сразу спросить партнёра. */
+/** Из «Партнёры»: открыть список, выделить вещи без «Кто платил» и сразу спросить партнёра. */
 /** Проданным вещам без «Деньги получил» — выбрать, кто получил, одним нажатием. */
 function fillSoldBy(items) {
   openPicker(`Кто получил деньги (${pieces(items.length)})`, walletList().map((n) => [n, walletLabel(n)]), async (name) => {
@@ -943,7 +941,7 @@ function fillSoldBy(items) {
   });
 }
 
-function bulkFillBuyer(ids, field = 'buyer') {
+function bulkFillBuyer(ids) {
   state.tab = 'Все';
   state.category = '';
   state.query = '';
@@ -954,7 +952,7 @@ function bulkFillBuyer(ids, field = 'buyer') {
   ids.forEach((id) => state.select.add(id));
   renderList();
   syncSelectBar();
-  bulkPick(field);
+  bulkPick('buyer');
 }
 
 async function bulkDelete() {
@@ -1118,9 +1116,6 @@ function renderList() {
   renderBuyerHint();
   const list = filtered();
   const note = $('#list-note');
-  // Поиск во «Все»: проданных там нет — подсказываем, сколько нашлось в «Продано»
-  const soldHits = state.tab === 'Все' && state.query.trim() ? filtered(STATUS.sold).length : 0;
-  const soldLink = () => (soldHits ? el('button', { type: 'button', class: 'link-btn sold-hits', onclick: () => switchTab(STATUS.sold) }, `Ещё ${pieces(soldHits)} в «Продано» ›`) : null);
   const box = $('#items');
   box.classList.toggle('grid', state.layout === 'grid' && list.length > 0);
 
@@ -1141,8 +1136,7 @@ function renderList() {
     const empty = el('div', { class: 'empty' }, icon('box'), el('b', { class: 'empty-title' }, title), text ? el('p', {}, text) : null,
       filteredOut ? el('button', { type: 'button', onclick: resetFilters }, 'Сбросить фильтры') : null,
       !state.items.length ? el('button', { type: 'button', class: 'primary', onclick: () => openForm('add') }, 'Добавить первую') : null,
-      filteredOut && state.tab !== 'Все' ? el('button', { type: 'button', class: 'link-btn', onclick: () => switchTab('Все') }, 'Искать во всех вкладках') : null,
-      soldLink());
+      filteredOut && state.tab !== 'Все' ? el('button', { type: 'button', class: 'link-btn', onclick: () => switchTab('Все') }, 'Искать во всех вкладках') : null);
     box.replaceChildren(el('li', {}, empty));
     return;
   }
@@ -1154,7 +1148,7 @@ function renderList() {
     const plan = list.reduce((s, i) => s + (i.planPrice || 0), 0);
     note.textContent = list.length > 1 ? `${pieces(list.length)}, план продаж ${rub(plan)}` : '';
   }
-  if (state.query.trim()) note.replaceChildren(`Найдено: ${pieces(list.length)}`, soldHits ? ' · ' : '', soldLink() || '');
+  if (state.query.trim()) note.textContent = `Найдено: ${pieces(list.length)}`;
   const ids = list.map((i) => i.id); // порядок для пролистывания карточек
   box.replaceChildren(...list.map((item) => itemRow(item, () => { state.navIds = ids; openItem(item.id); }, true)));
 }
@@ -1471,7 +1465,7 @@ const ITEM_FIELDS = [
   // бренд, размер, состояние и страна — метками над ценой, в таблице не дублируем
   ['category', 'Категория'], ['authenticity', 'Подлинность'], ['source', 'Источник'], ['consignor', 'Комитент'],
   ['commissionPct', 'Комиссия', (v) => `${v}%`],
-  ['buyPrice', 'Закуп', rub], ['buyDate', 'Дата закупа'], ['buyer', 'Чей бюджет'], ['seller', 'У кого куплено'],
+  ['buyPrice', 'Закуп', rub], ['buyDate', 'Дата закупа'], ['buyer', 'Кто платил'], ['seller', 'У кого куплено'],
   ['buyDoc', 'Документ'], ['planPrice', 'План продажи', rub], ['salePrice', 'Продано за', rub], ['saleDate', 'Дата продажи'],
   ['soldBy', 'Деньги получил'], ['notes', 'Заметки'], ['addedBy', 'Добавил'], ['changedBy', 'Изменил'],
   ['changedAt', 'Изменено'], ['id', 'ID'],
@@ -1533,12 +1527,12 @@ function openItem(id, opts) {
     if (item.consignor) sub.push('комитент ' + item.consignor);
     if (isNum(item.commissionPct)) sub.push(`комиссия ${item.commissionPct}%`);
   } else if (isNum(item.buyPrice)) sub.push('закуп ' + rub(item.buyPrice));
-  if (!isCommission(item) && item.buyer) sub.push('бюджет: ' + item.buyer);
+  if (!isCommission(item) && item.buyer) sub.push(item.buyer === COMMON ? 'из общей кассы' : 'платил ' + item.buyer);
   if (item.status === STATUS.sold && item.saleDate) sub.push('продано ' + item.saleDate);
-  if (item.status === STATUS.sold && payeeOf(item)) sub.push('деньги → ' + cashLabel(cashWallet(payeeOf(item))));
+  if (item.status === STATUS.sold && item.soldBy) sub.push(item.soldBy === COMMON ? 'деньги в кассе' : 'деньги у ' + item.soldBy);
   const subBox = $('#item-subprice');
   subBox.replaceChildren(sub.join(' · '));
-  // Не указано, чей бюджет, — ссылка «указать» прямо здесь (одно нажатие вместо «Изменить»)
+  // Не указано, кто платил, — ссылка «указать» прямо здесь (одно нажатие вместо «Изменить»)
   if (!isCommission(item) && !item.buyer && isNum(item.buyPrice) && item.buyPrice > 0) {
     subBox.append(sub.length ? ' · ' : '', el('button', { type: 'button', class: 'inline-link', onclick: () => pickBuyer(item) }, 'указать, кто платил'));
   }
@@ -1681,7 +1675,7 @@ async function optimistic(stale, patch, call, okMessage, undoTo) {
 /** Присмотренную вещь купили: кто платил → статус «В пути»/«В наличии», дата закупа — сегодня. */
 function markBought(status) {
   const item = state.current;
-  openPicker(`Чей бюджет — «${item.title}»`, walletList().map((p) => [p, walletLabel(p)]), (name) => {
+  openPicker(`Кто платил за «${item.title}»`, walletList().map((p) => [p, walletLabel(p)]), (name) => {
     rememberWallet(name);
     const version = item.changedAt;
     const patch = { status, buyer: name, buyDate: isoToRu(todayIso()) };
@@ -1693,9 +1687,9 @@ function markBought(status) {
 
 /** Выбрать «Кто платил» прямо из карточки. */
 function pickBuyer(item) {
-  openPicker('Чей бюджет — «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), (name) => {
+  openPicker('Кто платил за «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), (name) => {
     const version = item.changedAt;
-    optimistic(item, { buyer: name }, () => api('update', { id: item.id, version, buyer: name }), `Бюджет: ${name}`);
+    optimistic(item, { buyer: name }, () => api('update', { id: item.id, version, buyer: name }), `Кто платил: ${name}`);
   });
 }
 
@@ -1806,9 +1800,7 @@ function openSell() {
   f.reset();
   f.salePrice.value = isNum(state.current.planPrice) ? state.current.planPrice : '';
   f.saleDate.value = todayIso();
-  const payee = payeeOf(state.current);
-  fillPartnerSelect(f.soldBy, payee || lastWallet());
-  f.soldBy.closest('label').hidden = !!payee;
+  fillPartnerSelect(f.soldBy, lastWallet());
   // Быстрые цены: по плану, −5%, −10% (округление до сотни)
   const plan = state.current.planPrice;
   const quick = $('#sell-quick');
@@ -1854,12 +1846,11 @@ async function submitSell(e) {
     $('#sell-error').textContent = 'Выберите, кто получил деньги — от этого зависит, чьи это свободные деньги.'; f.soldBy.focus(); return;
   }
   const item = state.current;
-  const payee = payeeOf(item);
   const payload = {
     id: item.id, salePrice: Number(f.salePrice.value), saleDate: f.saleDate.value || todayIso(),
-    soldBy: payee || f.soldBy.value, version: item.changedAt,
+    soldBy: f.soldBy.value, version: item.changedAt,
   };
-  if (!payee) rememberWallet(payload.soldBy);
+  rememberWallet(payload.soldBy);
   closeSheet();
   optimistic(item, {
     status: STATUS.sold, salePrice: payload.salePrice, saleDate: isoToRu(payload.saleDate), soldBy: payload.soldBy,
@@ -1867,7 +1858,6 @@ async function submitSell(e) {
 }
 
 // ---------------------------------------------------------------- форма (добавить / изменить)
-
 
 const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'condition', 'country', 'source', 'authenticity', 'consignor',
   'commissionPct', 'buyPrice', 'buyDate', 'buyer', 'seller', 'buyDoc', 'planPrice', 'notes'];
@@ -1879,7 +1869,7 @@ const BUY_ONLY_FIELDS = ['buyPrice', 'buyer', 'seller'];
 const myName = () => (state.user && state.user.name) || '';
 /** Общие деньги (касса) — третий «кошелёк» наряду с личными деньгами партнёров. */
 const COMMON = 'Общие';
-const walletLabel = (n) => n;
+const walletLabel = (n) => (n === COMMON ? 'Общая касса' : n);
 const DEFAULT_PARTNERS = ['Арсений', 'Сева'];
 /** Люди, за чьи деньги покупаются вещи. Фиксированный список (с сервера), не зависит от того, кто открыл бота. */
 function partnerList() {
@@ -2000,8 +1990,6 @@ function syncFormExtras() {
   $('#buydate-label').textContent = commission ? 'Дата приёма' : 'Дата закупа';
   $('#buydoc-label').textContent = commission ? 'Договор комиссии' : 'Документ закупа';
   $('#sale-row').hidden = f.status.value !== STATUS.sold;
-  // «Деньги получил» нужен, только если не указано, кто платил: деньги получает плательщик
-  f.soldBy.closest('label').hidden = !!payeeOf({ source: f.source.value, buyer: f.buyer.value, consignor: f.consignor.value });
   const buy = f.buyPrice.value === '' ? null : Number(f.buyPrice.value);
   const plan = f.planPrice.value === '' ? null : Number(f.planPrice.value);
   const pct = f.commissionPct.value === '' ? null : Number(String(f.commissionPct.value).replace(',', '.'));
@@ -2092,7 +2080,7 @@ function collectForm() {
     const sold = data.status === STATUS.sold;
     data.salePrice = sold ? f.salePrice.value : '';
     data.saleDate = sold ? f.saleDate.value : '';
-    data.soldBy = sold ? (payeeOf(data) || f.soldBy.value) : '';
+    data.soldBy = sold ? f.soldBy.value : '';
   }
   return data;
 }
@@ -2327,30 +2315,26 @@ function moneyByWallet() {
       } else { unknownBuy += i.buyPrice; unknownBuyCount++; }
     }
     if (i.status === STATUS.sold && isNum(i.salePrice)) {
-      // Правило владельца: деньги с продажи получает тот, кто платил (кто бы ни продавал).
-      // Деньги Арсения — в общие. Комиссия со своей вещи — в общие, остальное владельцу.
-      const payee = payeeOf(i);
-      const r = payee ? w.get(cashWallet(payee)) : null;
+      const holder = walletOf(i.soldBy);
+      const r = holder ? w.get(cashWallet(holder)) : null;  // продажи Арсения — в общие
       if (!r) { unknownSale++; return; }
-      const at = t(i.saleDate, Infinity);
-      const add = (rr, cash) => { if (!rr || !cash) return; ev.push({ r: rr, at, order: 2, amount: cash }); rr.sales += cash; };
-      if (isCommission(i)) {
-        const fee = commissionFrom(i, i.salePrice) || 0;
-        if (!walletOf(i.consignor)) add(w.get(COMMON), fee); // чужая вещь: у нас только комиссия
-        else { add(r, i.salePrice - fee); add(w.get(COMMON), fee); }
-      } else add(r, i.salePrice);
+      let cash = i.salePrice;
+      // чужая вещь на комиссии: долю комитента отдали ему — у нас осталась комиссия
+      if (isCommission(i) && !walletOf(i.consignor)) cash = commissionFrom(i, i.salePrice) || 0;
+      ev.push({ r, at: t(i.saleDate, Infinity), order: 2, amount: cash });
+      r.sales += cash;
     }
   });
   ev.sort((a, b) => (a.at - b.at) || (a.order - b.order));
   ev.forEach((e) => {
     if (e.op) e.r.ops += e.amount;
-    if (e.buy && e.r.name !== COMMON) {
-      // Личный бюджет: закупка из свободных, сверх них — из своего кармана (в минус не уходит)
+    if (e.buy) {
+      // Не хватило свободных на закупку — недостающее вложено своими, свободные остаются на нуле
       const need = -e.amount;
       const avail = Math.max(0, e.r.free);
       if (need > avail) e.r.own += need - avail;
       e.r.free = Math.min(e.r.free, 0) + Math.max(0, avail - need);
-    } else e.r.free += e.amount; // «Общие»: капитал + продажи − закупки; минус = нужно добавить капитал
+    } else e.r.free += e.amount;
   });
   return { wallets: [...w.values()], unknownBuy, unknownBuyCount, unknownSale };
 }
@@ -2362,10 +2346,6 @@ function moneyByWallet() {
 function ownerOf(i) {
   if (isCommission(i)) return walletOf(i.consignor) || COMMON;
   return walletOf(i.buyer);
-}
-/** Кому идут деньги с продажи: тот, кто платил; если не указан — старое поле «Деньги получил». */
-function payeeOf(i) {
-  return ownerOf(i) || walletOf(i.soldBy);
 }
 /** Проданная вещь: кому сколько причитается. owner — владельцу, kassa — комиссия в кассу (у комиссионных своих). */
 function saleSplit(i) {
@@ -2485,10 +2465,9 @@ function renderMoney() {
       const v = w.byStatus[st] || { sum: 0, count: 0 };
       return el('div', { class: 'money-row' }, el('span', {}, label), el('b', {}, rub(v.sum)), el('small', {}, pieces(v.count)));
     }),
-    w.name === COMMON ? el('button', { type: 'button', class: 'money-capital', onclick: () => openMoney('in', { from: COMMON, capital: true }) }, '＋ Добавить капитал') : null,
     el('div', { class: 'money-row total' }, el('span', {}, 'Общее'), el('b', {}, rub(w.free + w.clothes))))));
   const notes = [];
-  if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Чей бюджет» — не вычтены ни из чьих денег.`);
+  if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Кто платил» — не вычтены ни из чьих денег.`);
   if (m.unknownSale) notes.push(`Продаж без «Деньги получил»: ${m.unknownSale} — не учтены.`);
   if (!state.money.length && state.moneyStatus === 'ok') notes.push('Живые деньги на руках внесите кнопкой «Пополнить».');
   $('#money-note').textContent = notes.join(' ');
@@ -2548,8 +2527,8 @@ function openMoney(kind, preset) {
   fill(f.to, (preset && preset.to) || cashWallets().find((n) => n !== f.wallet.value));
   f.amount.value = preset && preset.amount ? preset.amount : '';
   f.date.value = todayIso();
-  f.note.value = (preset && preset.note) || (preset && preset.capital ? 'Капитал' : '');
-  $('#money-title').textContent = preset && preset.capital ? 'Добавить капитал в «Общие»' : { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
+  f.note.value = (preset && preset.note) || '';
+  $('#money-title').textContent = { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
   $('#money-wallet-label').firstChild.textContent = kind === 'transfer' ? 'Откуда' : 'Кошелёк';
   $('#money-to-label').hidden = kind !== 'transfer';
   $('#money-error').textContent = '';
@@ -2602,7 +2581,7 @@ function renderPartners() {
     const isCommon = c.name === COMMON;
     const free = freeOf.get(c.name);
     return el('div', { class: 'partner-card' + (isCommon ? ' common' : '') },
-      el('button', { type: 'button', class: 'partner-name name-link', onclick: () => openOwner(c.name) }, isCommon ? '🏦 Общие' : c.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
+      el('button', { type: 'button', class: 'partner-name name-link', onclick: () => openOwner(c.name) }, isCommon ? '🏦 Общая касса' : c.name, el('span', { class: 'name-go', 'aria-hidden': 'true' }, '›')),
       isNum(free) ? el('div', { class: 'partner-free' }, el('span', {}, 'Свободные'), el('b', { class: free < 0 ? 'profit-minus' : '' }, rub(free))) : null,
       el('div', { class: 'partner-row' }, el('span', {}, 'Вложено'), el('b', {}, rub(c.buy)), el('small', {}, pieces(c.buyCount))),
       el('div', { class: 'partner-row' }, el('span', {}, 'Продано'), el('b', {}, rub(c.sale)), el('small', {}, pieces(c.saleCount))),
@@ -2614,7 +2593,7 @@ function renderPartners() {
   // Предупреждения: не указано, кто платил (закупка) / кто получил деньги (продажа) — это разные вещи
   const unk = $('#partner-unknown');
   const noBuyerItems = realItems().filter((i) => !isCommission(i) && isNum(i.buyPrice) && i.buyPrice > 0 && !walletOf(i.buyer));
-  const noSoldByItems = state.items.filter((i) => i.status === STATUS.sold && isNum(i.salePrice) && !payeeOf(i));
+  const noSoldByItems = state.items.filter((i) => i.status === STATUS.sold && isNum(i.salePrice) && !walletOf(i.soldBy));
   const notice = (title, text, items, action) => {
     const list = el('ul', { class: 'items', hidden: true }, items.slice(0, 30).map((i) => itemRow(i)));
     return el('div', { class: 'notice' },
@@ -2624,8 +2603,8 @@ function renderPartners() {
       list);
   };
   unk.replaceChildren(...[
-    noBuyerItems.length ? notice(`Не указано, чей бюджет: ${pieces(noBuyerItems.length)}`,
-      `Закупки на ${rub(noBuyerItems.reduce((a, i) => a + i.buyPrice, 0))} ни из чьих денег не вычтены. Укажите «Чей бюджет» сразу всем — или по одной: вещь → «Изменить».`,
+    noBuyerItems.length ? notice(`Не указано, кто платил: ${pieces(noBuyerItems.length)}`,
+      `Закупки на ${rub(noBuyerItems.reduce((a, i) => a + i.buyPrice, 0))} ни из чьих денег не вычтены. Укажите «Кто платил» сразу всем — или по одной: вещь → «Изменить».`,
       noBuyerItems, el('button', { type: 'button', class: 'primary', onclick: () => bulkFillBuyer(noBuyerItems.map((i) => i.id)) }, `Указать разом (${noBuyerItems.length})`)) : null,
     noSoldByItems.length ? notice(`Не указано, кто получил деньги: ${pieces(noSoldByItems.length)}`,
       `Продажи на ${rub(noSoldByItems.reduce((a, i) => a + i.salePrice, 0))} не попали ни в чьи свободные деньги.`,
