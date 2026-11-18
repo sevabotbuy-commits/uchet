@@ -33,6 +33,8 @@ const TABS = [STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold, '�
 const isIdea = (i) => i.status === STATUS.idea;
 /** Вещи «в учёте» — без присмотренных. */
 const realItems = () => state.items.filter((i) => !isIdea(i));
+/** Вкладка «Все» — вещи в работе: без проданных (они только в «Продано») и без «Можно купить». */
+const inAllTab = (i) => !isIdea(i) && i.status !== STATUS.sold;
 const STALE_DAYS = 60;          // «долго лежит»
 const AUTO_REFRESH_MS = 60000;  // при возврате в приложение обновлять, если данные старше минуты
 const CACHE_KEY = DEMO ? 'uv.demo.cache' : 'uv.cache';
@@ -454,7 +456,7 @@ const tabIndex = (t) => TABS.indexOf(t);
 function renderTabs() {
   const box = $('#status-tabs');
   box.replaceChildren(tabIndicator, ...TABS.map((t) => {
-    const n = t === 'Все' ? realItems().length : state.items.filter((i) => i.status === t).length;
+    const n = t === 'Все' ? state.items.filter(inAllTab).length : state.items.filter((i) => i.status === t).length;
     return el('button', {
       type: 'button', role: 'tab', 'aria-selected': String(state.tab === t),
       onclick: () => switchTab(t),
@@ -573,7 +575,7 @@ function bindTabSwipe() {
 }
 
 function renderChips() {
-  const pool = state.tab === 'Все' ? state.items : state.items.filter((i) => i.status === state.tab);
+  const pool = state.tab === 'Все' ? state.items.filter(inAllTab) : state.items.filter((i) => i.status === state.tab);
   const cats = [...new Set(pool.map((i) => i.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ru'));
   // Выбранной категории нет в этой вкладке — сбрасываем выбор, а не показываем её с нулём
   if (state.category && !cats.includes(state.category)) state.category = '';
@@ -666,13 +668,13 @@ function searchVariants(word) {
   return out;
 }
 
-function filtered() {
+function filtered(tab = state.tab) {
   const words = state.query.trim().toLowerCase().split(/\s+/).filter(Boolean).map(searchVariants);
   return state.items
     .map((i, idx) => Object.assign({}, i, { _idx: idx }))
     .filter((i) => {
-      if (state.tab !== 'Все' && i.status !== state.tab) return false;
-      if (state.tab === 'Все' && isIdea(i)) return false; // присмотренные — только в своей вкладке
+      if (tab !== 'Все' && i.status !== tab) return false;
+      if (tab === 'Все' && !inAllTab(i)) return false; // проданные и присмотренные — только в своих вкладках
       if (state.owner && ownerOf(i) !== state.owner) return false;
       if (state.category && i.category !== state.category) return false;
       if (!words.length) return true;
@@ -1116,6 +1118,9 @@ function renderList() {
   renderBuyerHint();
   const list = filtered();
   const note = $('#list-note');
+  // Поиск во «Все»: проданных там нет — подсказываем, сколько нашлось в «Продано»
+  const soldHits = state.tab === 'Все' && state.query.trim() ? filtered(STATUS.sold).length : 0;
+  const soldLink = () => (soldHits ? el('button', { type: 'button', class: 'link-btn sold-hits', onclick: () => switchTab(STATUS.sold) }, `Ещё ${pieces(soldHits)} в «Продано» ›`) : null);
   const box = $('#items');
   box.classList.toggle('grid', state.layout === 'grid' && list.length > 0);
 
@@ -1136,7 +1141,8 @@ function renderList() {
     const empty = el('div', { class: 'empty' }, icon('box'), el('b', { class: 'empty-title' }, title), text ? el('p', {}, text) : null,
       filteredOut ? el('button', { type: 'button', onclick: resetFilters }, 'Сбросить фильтры') : null,
       !state.items.length ? el('button', { type: 'button', class: 'primary', onclick: () => openForm('add') }, 'Добавить первую') : null,
-      filteredOut && state.tab !== 'Все' ? el('button', { type: 'button', class: 'link-btn', onclick: () => switchTab('Все') }, 'Искать во всех вкладках') : null);
+      filteredOut && state.tab !== 'Все' ? el('button', { type: 'button', class: 'link-btn', onclick: () => switchTab('Все') }, 'Искать во всех вкладках') : null,
+      soldLink());
     box.replaceChildren(el('li', {}, empty));
     return;
   }
@@ -1148,7 +1154,7 @@ function renderList() {
     const plan = list.reduce((s, i) => s + (i.planPrice || 0), 0);
     note.textContent = list.length > 1 ? `${pieces(list.length)}, план продаж ${rub(plan)}` : '';
   }
-  if (state.query.trim()) note.textContent = `Найдено: ${pieces(list.length)}`;
+  if (state.query.trim()) note.replaceChildren(`Найдено: ${pieces(list.length)}`, soldHits ? ' · ' : '', soldLink() || '');
   const ids = list.map((i) => i.id); // порядок для пролистывания карточек
   box.replaceChildren(...list.map((item) => itemRow(item, () => { state.navIds = ids; openItem(item.id); }, true)));
 }
