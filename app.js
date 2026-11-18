@@ -2328,7 +2328,9 @@ function moneyByWallet() {
   ev.sort((a, b) => (a.at - b.at) || (a.order - b.order));
   ev.forEach((e) => {
     if (e.op) e.r.ops += e.amount;
-    if (e.buy) {
+    if (e.buy && e.r.name === COMMON) {
+      e.r.free += e.amount; // «Общие» могут уйти в минус — тогда нужно внести капитал
+    } else if (e.buy) {
       // Не хватило свободных на закупку — недостающее вложено своими, свободные остаются на нуле
       const need = -e.amount;
       const avail = Math.max(0, e.r.free);
@@ -2465,6 +2467,7 @@ function renderMoney() {
       const v = w.byStatus[st] || { sum: 0, count: 0 };
       return el('div', { class: 'money-row' }, el('span', {}, label), el('b', {}, rub(v.sum)), el('small', {}, pieces(v.count)));
     }),
+    w.name === COMMON ? el('button', { type: 'button', class: 'money-capital', onclick: () => openMoney('in', { from: COMMON, capital: true }) }, '＋ Внести капитал') : null,
     el('div', { class: 'money-row total' }, el('span', {}, 'Общее'), el('b', {}, rub(w.free + w.clothes))))));
   const notes = [];
   if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Кто платил» — не вычтены ни из чьих денег.`);
@@ -2527,8 +2530,8 @@ function openMoney(kind, preset) {
   fill(f.to, (preset && preset.to) || cashWallets().find((n) => n !== f.wallet.value));
   f.amount.value = preset && preset.amount ? preset.amount : '';
   f.date.value = todayIso();
-  f.note.value = (preset && preset.note) || '';
-  $('#money-title').textContent = { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
+  f.note.value = (preset && preset.note) || (preset && preset.capital ? 'Капитал' : '');
+  $('#money-title').textContent = preset && preset.capital ? 'Внести капитал в «Общие»' : { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
   $('#money-wallet-label').firstChild.textContent = kind === 'transfer' ? 'Откуда' : 'Кошелёк';
   $('#money-to-label').hidden = kind !== 'transfer';
   $('#money-error').textContent = '';

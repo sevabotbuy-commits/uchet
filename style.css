@@ -719,3 +719,5 @@ body:has(.sheet:not([hidden])) .toast { bottom: auto; top: calc(12px + env(safe-
 
 /* ---- «Можно купить» */
 .status.s-idea { background: color-mix(in srgb, var(--link) 12%, transparent); color: var(--link); }
+/* «＋ Внести капитал» на карточке «Общие» */
+.money-capital { width: 100%; margin: 8px 0 2px; min-height: 40px; border-radius: 10px; background: var(--btn); color: var(--btn-text); font-weight: 700; font-size: 13.5px; }
