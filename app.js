@@ -38,7 +38,6 @@ const inAllTab = (i) => !isIdea(i) && i.status !== STATUS.sold;
 const STALE_DAYS = 60;          // «долго лежит»
 const AUTO_REFRESH_MS = 60000;  // при возврате в приложение обновлять, если данные старше минуты
 const CACHE_KEY = DEMO ? 'uv.demo.cache' : 'uv.cache';
-const DRAFT_KEY = DEMO ? 'uv.demo.draft' : 'uv.draft';
 const DEFAULT_LISTS = {
   category: [],
   condition: ['Новое с бирками', 'Отличное', 'Хорошее', 'Есть следы носки'],
@@ -355,6 +354,7 @@ async function goBack() {
     renderStats();
     return;
   }
+  if (state.view === 'form' && state.form.saving) return;
   if (state.view === 'form' && state.form.dirty && state.form.mode === 'edit') {
     if (!(await ask('Выйти без сохранения изменений?'))) return;
   }
@@ -405,7 +405,7 @@ async function loadItems({ silent = false, force = false } = {}) {
   try {
     const fresh = await api('list');
     // Пока ждали ответ, что-то поменяли на экране — этот ответ уже устарел, не применяем.
-    if (!force && (state.seq !== seq || state.pending)) return;
+    if (state.seq !== seq || (state.pending && !force)) return;
     // Вещи, удаление которых ещё можно отменить, не показываем.
     state.items = pendingDeletes.size ? fresh.filter((i) => !pendingDeletes.has(i.id)) : fresh;
     state.lastLoad = Date.now();
@@ -1538,8 +1538,8 @@ function openItem(id, opts) {
   const subBox = $('#item-subprice');
   subBox.replaceChildren(sub.join(' · '));
   // Не указано, кто платил, — ссылка «указать» прямо здесь (одно нажатие вместо «Изменить»)
-  if (!isCommission(item) && !item.buyer && isNum(item.buyPrice) && item.buyPrice > 0) {
-    subBox.append(sub.length ? ' · ' : '', el('button', { type: 'button', class: 'inline-link', onclick: () => pickBuyer(item) }, 'указать, кто платил'));
+  if (!isCommission(item) && item.status !== STATUS.idea && (item.buyer || (isNum(item.buyPrice) && item.buyPrice > 0))) {
+    subBox.append(sub.length ? ' · ' : '', el('button', { type: 'button', class: 'inline-link', onclick: () => pickBuyer(item) }, item.buyer ? 'сменить покупателя' : 'указать, кто платил'));
   }
 
   const rows = [];
@@ -1945,11 +1945,14 @@ function openForm(mode, source) {
   const f = $('#item-form');
   f.reset();
   fillSelects();
+  $('#form-submit').disabled = false;
+  $('#form-submit').textContent = mode === 'edit' ? 'Сохранить' : 'Добавить';
   state.form = { mode, photo: null, removePhoto: false, dirty: false, hadPhoto: false };
   $('#form-error').textContent = '';
   $('#btn-delete').hidden = mode !== 'edit';
   $('#form-title').textContent = mode === 'edit' ? 'Изменить вещь' : 'Новая вещь';
   setFormPhoto(null);
+  $('#photo-preview').classList.remove('loading');
   // Статус: при добавлении — «В наличии», «В пути» или «Можно купить», при правке — все.
   const statuses = mode === 'edit'
     ? [...new Set([...DEFAULT_LISTS.status, ...(state.lists.status || [])])]
@@ -1969,23 +1972,18 @@ function openForm(mode, source) {
       const src = state.fullPhotos.get(item.id) || state.photos.get(item.id);
       setFormPhoto(src, true);
       if (!src) {
+        const form = state.form;
         loadFullPhoto(item.id).then((full) => {
           // Подставляем, только если пользователь ещё не выбрал новое и не убрал фото.
-          if (full && state.view === 'form' && !state.form.photo && !state.form.removePhoto) setFormPhoto(full, true);
+          if (full && state.view === 'form' && state.form === form && !form.photo && !form.removePhoto) setFormPhoto(full, true);
         });
       }
     }
   } else {
-    const saved = !source && storage.get(DRAFT_KEY);
-    const draft = saved && ['title', 'brand', 'notes', 'buyPrice', 'planPrice'].some((k) => saved[k]) ? saved : null;
-    const base = source || draft || {};
-    (source ? CLONE_FIELDS : FORM_FIELDS).forEach((k) => setField(f, k, base[k]));
-    if (draft && !source) toast('Восстановлен черновик');
-    if (!f.buyDate.value) f.buyDate.value = todayIso();
+    (source ? CLONE_FIELDS : FORM_FIELDS).forEach((k) => setField(f, k, source && source[k]));
+    f.buyDate.value = todayIso();
     if (!f.source.value && state.lists.source.includes('Выкуп')) f.source.value = 'Выкуп';
     if (!f.authenticity.value && state.lists.authenticity.includes('Не проверено')) f.authenticity.value = 'Не проверено';
-    if (!f.category.value && state.category) f.category.value = state.category;
-    if (!f.buyer.value) setField(f, 'buyer', lastWallet());
     f.status.value = state.tab === STATUS.inTransit || state.tab === STATUS.idea ? state.tab : STATUS.inStock;
     if (f.status.value === STATUS.idea) setField(f, 'buyer', ''); // присмотренную ещё не купили — платить некому
   }
@@ -2025,12 +2023,6 @@ function onFormInput(e) {
   state.form.dirty = true;
   setClosingGuard(true);
   syncFormExtras();
-  if (state.form.mode === 'add') {
-    const f = $('#item-form');
-    const draft = {};
-    FORM_FIELDS.forEach((k) => { draft[k] = f.elements[k].value; });
-    storage.set(DRAFT_KEY, draft);
-  }
 }
 
 /** Уменьшает фото до 1600 px по длинной стороне и сжимает в JPEG (~250–450 КБ). */
@@ -2059,10 +2051,14 @@ async function compressImage(file) {
 async function onPhotoPicked(e) {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
+  const form = state.form;
+  const selection = {};
+  form.photoSelection = selection;
   const preview = $('#photo-preview');
   preview.classList.add('loading');
   try {
     const ph = await compressImage(file);
+    if (state.form !== form || form.photoSelection !== selection) return;
     state.form.photo = { mime: ph.mime, base64: ph.base64, dataUrl: ph.dataUrl };
     state.form.removePhoto = false;
     state.form.dirty = true;
@@ -2070,12 +2066,17 @@ async function onPhotoPicked(e) {
   } catch (err) {
     toast(err.message);
   } finally {
-    preview.classList.remove('loading');
-    e.target.value = '';
+    if (state.form === form && form.photoSelection === selection) {
+      form.photoSelection = null;
+      preview.classList.remove('loading');
+      e.target.value = '';
+    }
   }
 }
 
 function onPhotoRemove() {
+  state.form.photoSelection = null;
+  $('#photo-preview').classList.remove('loading');
   state.form.photo = null;
   state.form.removePhoto = state.form.hadPhoto;
   state.form.dirty = true;
@@ -2104,6 +2105,9 @@ async function submitForm(e) {
   e.preventDefault();
   const f = e.target;
   const err = $('#form-error');
+  const form = state.form;
+  if (form.saving) return;
+  if (form.photoSelection) { err.textContent = 'Фото ещё обрабатывается. Попробуйте ещё раз через секунду.'; return; }
   const data = collectForm();
   err.textContent = '';
   f.querySelectorAll('.invalid').forEach((n) => n.classList.remove('invalid'));
@@ -2127,45 +2131,68 @@ async function submitForm(e) {
   }
 
   const btn = $('#form-submit');
+  form.saving = true;
   btn.disabled = true;
-  btn.textContent = state.form.photo ? 'Загружаю фото…' : 'Сохраняю…';
+  btn.textContent = form.photo ? 'Загружаю фото…' : 'Сохраняю…';
   mainButtonBusy(true);
-  const photo = state.form.photo ? { mime: state.form.photo.mime, base64: state.form.photo.base64 } : undefined;
+  const photo = form.photo ? { mime: form.photo.mime, base64: form.photo.base64 } : undefined;
+  state.seq++;
   try {
-    if (state.form.mode === 'edit') {
-      const item = state.current;
-      state.seq++; // ответ загрузки, начатой до сохранения, уже устарел
-      await api('update', Object.assign(data, { id: item.id, version: item.changedAt, photo, removePhoto: state.form.removePhoto }));
-      if (photo) { state.photos.set(item.id, state.form.photo.dataUrl); state.fullPhotos.set(item.id, state.form.photo.dataUrl); photoKeys.set(item.id, 'local'); }
-      if (state.form.removePhoto) { state.photos.delete(item.id); state.fullPhotos.delete(item.id); }
-      state.form.dirty = false;
+    if (form.mode === 'edit') {
+      const original = state.current;
+      await writeChains.get(original.id);
+      const item = state.items.find((i) => i.id === original.id) || original;
+      const res = await api('update', Object.assign(data, { id: item.id, version: item.changedAt, photo, removePhoto: form.removePhoto }));
+      if (res.item) Object.assign(item, res.item);
+      if (photo) {
+        state.photos.set(item.id, form.photo.dataUrl);
+        state.fullPhotos.set(item.id, form.photo.dataUrl);
+        photoKeys.set(item.id, item.photoKey || 'local');
+      }
+      if (form.removePhoto) { state.photos.delete(item.id); state.fullPhotos.delete(item.id); }
+      form.dirty = false;
+      saveCache();
       haptic('success');
       toast('Сохранено ✓');
-      // force: показать сохранённое, даже если рядом ждёт удаление. Сбой обновления — не ошибка сохранения.
-      await loadItems({ silent: true, force: true }).catch(() => toast('Сохранено ✓ Список обновится позже — потяните вниз'));
-      openItem(item.id, { push: false });
-      state.stack = ['list'];
+      if (state.view === 'form' && state.form === form) {
+        openItem(item.id, { push: false });
+        state.stack = ['list'];
+      } else refreshCurrentView();
+      if (!res.item) loadItems({ silent: true, force: true }).catch(() => {});
     } else {
-      state.seq++;
-      const res = await api('add', Object.assign(data, { photo }));
-      if (photo) { state.photos.set(res.id, state.form.photo.dataUrl); state.fullPhotos.set(res.id, state.form.photo.dataUrl); photoKeys.set(res.id, 'local'); }
-      state.form.dirty = false;
-      storage.del(DRAFT_KEY);
+      form.requestId ||= 'a' + Array.from(crypto.getRandomValues(new Uint8Array(12)), (n) => n.toString(16).padStart(2, '0')).join('');
+      const res = await api('add', Object.assign(data, { photo, requestId: form.requestId }));
+      if (photo && !res.repeat) {
+        state.photos.set(res.id, form.photo.dataUrl);
+        state.fullPhotos.set(res.id, form.photo.dataUrl);
+        photoKeys.set(res.id, res.item?.photoKey || 'local');
+      }
+      if (res.item && !state.items.some((item) => item.id === res.id)) state.items.push(res.item);
+      form.dirty = false;
+      saveCache();
       haptic('success');
       toast(data.status === STATUS.inTransit ? 'Добавлена во «В пути» ✓' : data.status === STATUS.idea ? 'Добавлена в «Можно купить» ✓' : 'Вещь добавлена ✓');
-      state.tab = data.status === STATUS.inTransit || data.status === STATUS.idea ? data.status : STATUS.inStock;
-      state.owner = ''; // новая вещь не должна спрятаться за отбором по человеку
-      state.query = '';
-      $('#search').value = '';
-      show('list');
-      await loadItems({ silent: true, force: true }).catch(() => toast('Вещь добавлена ✓ Список обновится позже — потяните вниз')); // force: новая вещь видна сразу
+      if (state.view === 'form' && state.form === form) {
+        state.tab = res.item?.status || data.status;
+        state.owner = '';
+        state.category = '';
+        state.query = '';
+        $('#search').value = '';
+        $('#search-clear').hidden = true;
+        show('list');
+      }
+      refreshCurrentView();
+      if (!res.item) loadItems({ silent: true, force: true }).catch(() => {});
     }
   } catch (ex) {
     handleWriteError(ex, err);
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Сохранить';
-    mainButtonBusy(false);
+    form.saving = false;
+    if (state.form === form) {
+      btn.disabled = false;
+      btn.textContent = form.mode === 'edit' ? 'Сохранить' : 'Добавить';
+      mainButtonBusy(false);
+    }
   }
 }
 
@@ -2492,6 +2519,7 @@ function renderMoney() {
       return el('div', { class: 'money-row' }, el('span', {}, label), el('b', {}, rub(v.sum)), el('small', {}, pieces(v.count)));
     }),
     w.name === COMMON ? el('button', { type: 'button', class: 'money-capital', onclick: () => openMoney('in', { from: COMMON, capital: true }) }, '＋ Внести капитал') : null,
+    el('button', { type: 'button', class: 'money-capital', onclick: () => openMoney('out', { from: w.name }) }, '− Вывести'),
     el('div', { class: 'money-row total' }, el('span', {}, 'Общее'), el('b', {}, rub(w.free + w.clothes))))));
   const notes = [];
   if (m.unknownBuyCount) notes.push(`${pieces(m.unknownBuyCount)} на ${rub(m.unknownBuy)} без «Кто платил» — не вычтены ни из чьих денег.`);
@@ -2512,7 +2540,8 @@ function renderMoney() {
       ? `🔁 ${cashLabel(from.wallet)} → ${cashLabel(to.wallet)}: ${rub(to.amount)}`
       : (op.amount >= 0 ? `➕ ${cashLabel(op.wallet)}: +${rub(op.amount)}` : `➖ ${cashLabel(op.wallet)}: −${rub(-op.amount)}`);
     return el('li', { class: 'history-row money-op' },
-      el('div', { class: 'history-text' }, text, op.note ? el('div', { class: 'muted-small' }, op.note) : null),
+      el('div', { class: 'history-text' }, text, op.note ? el('div', { class: 'muted-small' }, op.note) : null,
+        op.who && !op.link ? el('div', { class: 'muted-small' }, (op.amount < 0 ? 'Вывел(а): ' : 'Внёс(ла): ') + op.who) : null),
       el('div', { class: 'history-when' }, op.date),
       el('button', { type: 'button', class: 'op-del', 'aria-label': 'Удалить операцию', onclick: () => deleteMoneyOp(op) }, '×'));
   }) : [el('li', { class: 'muted' }, 'Операций пока нет.')]));
@@ -2554,8 +2583,10 @@ function openMoney(kind, preset) {
   fill(f.to, (preset && preset.to) || cashWallets().find((n) => n !== f.wallet.value));
   f.amount.value = preset && preset.amount ? preset.amount : '';
   f.date.value = todayIso();
-  f.note.value = (preset && preset.note) || (preset && preset.capital ? 'Капитал' : '');
-  $('#money-title').textContent = preset && preset.capital ? 'Внести капитал в «Общие»' : { in: 'Пополнить', out: 'Вывести / потратить', transfer: 'Перевод между кошельками' }[kind];
+  f.note.value = (preset && preset.note) || '';
+  $('#money-source-label').hidden = !(preset && preset.capital);
+  $('#money-actor').textContent = kind === 'out' && myName() ? 'Вывод будет подписан: ' + myName() : '';
+  $('#money-title').textContent = preset && preset.capital ? 'Внести капитал в «Общие»' : { in: 'Пополнить', out: 'Вывести деньги', transfer: 'Перевод между кошельками' }[kind];
   $('#money-wallet-label').firstChild.textContent = kind === 'transfer' ? 'Откуда' : 'Кошелёк';
   $('#money-wallet-label').hidden = !!(preset && preset.capital); // капитал — всегда в «Общие»
   $('#money-to-label').hidden = kind !== 'transfer';
@@ -2568,11 +2599,16 @@ function openMoney(kind, preset) {
 async function submitMoney(e) {
   e.preventDefault();
   const f = e.target;
+  const btn = f.querySelector('button[type=submit]');
+  if (btn.disabled) return;
   const amount = Number(f.amount.value);
   if (!(amount > 0)) { $('#money-error').textContent = 'Укажите сумму больше нуля.'; f.amount.focus(); return; }
   if (f.kind.value === 'transfer' && f.to.value === f.wallet.value) { $('#money-error').textContent = 'Выберите разные кошельки.'; return; }
   const payload = { kind: f.kind.value, wallet: f.wallet.value, to: f.to.value, amount, date: f.date.value || todayIso(), note: f.note.value.trim(), opId: f.dataset.opId };
-  const btn = f.querySelector('button[type=submit]');
+  if (!$('#money-source-label').hidden) {
+    payload.capitalSource = f.capitalSource.value.trim();
+    if (!payload.capitalSource) { $('#money-error').textContent = 'Укажите, откуда поступил капитал.'; f.capitalSource.focus(); return; }
+  }
   btn.disabled = true;
   try {
     await api('moneyAdd', payload);
@@ -2897,10 +2933,11 @@ async function demoApi(action, p) {
     case 'moneyAdd': {
       const nid = () => Math.random().toString(16).slice(2, 10);
       const date = isoToRu(p.date || todayIso());
+      const note = p.capitalSource ? 'Капитал · Источник: ' + p.capitalSource + (p.note ? ' · ' + p.note : '') : p.note || '';
       if (p.kind === 'transfer') {
         const link = nid();
         demoDb.money.push({ id: nid(), date, wallet: p.wallet, amount: -p.amount, note: p.note || '', link }, { id: nid(), date, wallet: p.to, amount: p.amount, note: p.note || '', link });
-      } else demoDb.money.push({ id: nid(), date, wallet: p.wallet, amount: p.kind === 'in' ? p.amount : -p.amount, note: p.note || '', link: '' });
+      } else demoDb.money.push({ id: nid(), date, wallet: p.wallet, amount: p.kind === 'in' ? p.amount : -p.amount, note, who: 'Антон', link: '' });
       return { ok: true };
     }
     case 'moneyDelete': {
@@ -2922,15 +2959,18 @@ async function demoApi(action, p) {
       return demoDb.photos.get(p.id) || demoPhoto(it);
     }
     case 'add': {
-      const id = Math.random().toString(16).slice(2, 10);
+      const id = p.requestId || Math.random().toString(16).slice(2, 10);
+      const existing = demoDb.items.find((item) => item.id === id);
+      if (existing) return { id, item: { ...existing }, repeat: true };
       const it = { ...p, id, buyPrice: num(p.buyPrice), planPrice: num(p.planPrice), commissionPct: num(p.commissionPct),
         buyDate: isoToRu(p.buyDate), status: p.status === STATUS.inTransit || p.status === STATUS.idea ? p.status : STATUS.inStock,
-        buyer: p.source === COMMISSION ? '' : (p.buyer || (p.status === STATUS.idea ? '' : 'Антон')), hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
+        buyer: p.source === COMMISSION ? '' : (p.buyer || ''), hasPhoto: Boolean(p.photo), addedBy: 'Демо' };
       if (p.photo) { demoDb.photos.set(id, p.photo); it.photoKey = 'demo-' + Date.now(); }
       delete it.photo;
+      delete it.requestId;
       touch(it);
       demoDb.items.push(it);
-      return { id };
+      return { id, item: { ...it } };
     }
     case 'update': {
       const it = find(p.id);
@@ -2944,7 +2984,7 @@ async function demoApi(action, p) {
       Object.assign(it, patch);
       if (it.status !== STATUS.sold) { it.salePrice = null; it.saleDate = ''; it.soldBy = ''; }
       touch(it);
-      return { id: p.id, version: it.changedAt };
+      return { id: p.id, version: it.changedAt, item: { ...it } };
     }
     case 'sell': { const it = find(p.id); Object.assign(it, { status: STATUS.sold, salePrice: p.salePrice, saleDate: isoToRu(p.saleDate), soldBy: p.soldBy || 'Антон' }); touch(it); return { id: p.id, version: it.changedAt }; }
     case 'setStatus': { const it = find(p.id); Object.assign(it, { status: p.status, salePrice: null, saleDate: '', soldBy: '' }); touch(it); return { id: p.id, version: it.changedAt }; }
