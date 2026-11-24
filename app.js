@@ -389,9 +389,11 @@ function persistCache() {
 }
 
 async function loadItems({ silent = false, force = false } = {}) {
-  if (state.loading) { if (force) state.reloadAfter = true; return; }
-  // Пока сохраняются изменения, не затираем их старыми данными с сервера (кроме случая конфликта — force).
-  if (state.pending && !force) return;
+  if (state.loading || writeChains.size || state.form.saving || (state.pending && !force)) {
+    if (force) state.reloadAfter = true;
+    return;
+  }
+  state.reloadAfter = false;
   const seq = state.seq;
   setLoading(true);
   if (!silent && !state.items.length) {
@@ -405,7 +407,10 @@ async function loadItems({ silent = false, force = false } = {}) {
   try {
     const fresh = await api('list');
     // Пока ждали ответ, что-то поменяли на экране — этот ответ уже устарел, не применяем.
-    if (state.seq !== seq || (state.pending && !force)) return;
+    if (state.seq !== seq || writeChains.size || state.form.saving || (state.pending && !force)) {
+      if (force) state.reloadAfter = true;
+      return;
+    }
     // Вещи, удаление которых ещё можно отменить, не показываем.
     state.items = pendingDeletes.size ? fresh.filter((i) => !pendingDeletes.has(i.id)) : fresh;
     state.lastLoad = Date.now();
@@ -416,7 +421,7 @@ async function loadItems({ silent = false, force = false } = {}) {
     prefetchThumbs();
   } finally {
     setLoading(false);
-    if (state.reloadAfter) { state.reloadAfter = false; loadItems({ silent: true, force: true }).catch(() => {}); }
+    if (state.reloadAfter && !writeChains.size && !state.form.saving) loadItems({ silent: true, force: true }).catch(() => {});
   }
 }
 
@@ -1644,17 +1649,22 @@ const writeChains = new Map();
 /** call(version) получает актуальную версию вещи — в момент отправки, после предыдущей записи этой вещи. */
 async function optimistic(stale, patch, call, okMessage, undoTo) {
   const item = state.items.find((i) => i.id === stale.id) || stale; // актуальный объект из списка
-  const before = { ...item };
+  let queue = writeChains.get(item.id);
+  if (!queue) {
+    queue = { confirmed: { ...item }, patches: [], done: Promise.resolve() };
+    writeChains.set(item.id, queue);
+  }
+  queue.patches.push(patch);
   Object.assign(item, patch);
   state.pending++;
-  saveCache();
+  state.seq++;
   refreshCurrentView();
   haptic('success');
   // undoTo — статус, к которому вернёт «Отменить» (только «В пути» / «В наличии» / «Бронь»)
   let resolveSaved;
   const saved = new Promise((r) => { resolveSaved = r; });
   const canUndo = [STATUS.inTransit, STATUS.inStock, STATUS.reserved].includes(undoTo);
-  toast(okMessage, canUndo ? 5000 : 3000, canUndo ? {
+  if (okMessage) toast(okMessage, canUndo ? 5000 : 3000, canUndo ? {
     label: 'Отменить',
     fn: async () => {
       if (!(await saved)) return; // сохранение не прошло — откатилось само
@@ -1663,28 +1673,34 @@ async function optimistic(stale, patch, call, okMessage, undoTo) {
         (v) => api('setStatus', { id: live.id, status: undoTo, version: v }), `Отменено — снова «${undoTo}»`);
     },
   } : undefined);
-  const prev = writeChains.get(item.id) || Promise.resolve();
-  const run = prev.then(() => call(item.changedAt));
-  const chain = run.catch(() => {});
-  writeChains.set(item.id, chain);
-  chain.then(() => { if (writeChains.get(item.id) === chain) writeChains.delete(item.id); });
-  try {
-    const res = await run;
-    // Сервер вернул новую версию — следующее действие с вещью пройдёт без перезагрузки списка
-    if (res && res.version) item.changedAt = res.version;
+  queue.done = queue.done.then(async () => {
+    let failure;
+    let needsRefresh = false;
+    try {
+      const result = await call(queue.confirmed.changedAt);
+      Object.assign(queue.confirmed, result?.item || patch);
+      if (result?.version) queue.confirmed.changedAt = result.version;
+      needsRefresh = !result?.item;
+    } catch (error) {
+      failure = error;
+    }
+    queue.patches.shift();
     state.pending--;
-    resolveSaved(true);
-    if (!state.pending) loadItems({ silent: true }).catch(() => {}); // запись уже прошла — сбой обновления не откатывает её
-  } catch (e) {
-    state.pending--;
-    resolveSaved(false);
-    const version = item.changedAt; // версию, полученную от предыдущих записей, не откатываем
-    Object.keys(item).forEach((k) => { delete item[k]; });
-    Object.assign(item, before, { changedAt: version });
-    saveCache();
+    const live = state.items.find((entry) => entry.id === item.id) || item;
+    Object.keys(patch).forEach((key) => { if (!(key in queue.confirmed)) delete live[key]; });
+    Object.assign(live, queue.confirmed, ...queue.patches);
+    state.seq++;
+    if (!state.pending) persistCache();
     refreshCurrentView();
-    handleWriteError(e);
-  }
+    if (!queue.patches.length) writeChains.delete(item.id);
+    resolveSaved(!failure);
+    if (failure) handleWriteError(failure);
+    if (state.reloadAfter || (!state.pending && needsRefresh)) {
+      loadItems({ silent: true, force: state.reloadAfter }).catch(() => {});
+    }
+  });
+  await queue.done;
+  return saved;
 }
 
 /** Присмотренную вещь купили: кто платил → статус «В пути»/«В наличии», дата закупа — сегодня. */
@@ -1701,8 +1717,10 @@ function markBought(status) {
 
 /** Выбрать «Кто платил» прямо из карточки. */
 function pickBuyer(item) {
-  openPicker('Кто платил за «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), (name) => {
-    optimistic(item, { buyer: name }, (v) => api('update', { id: item.id, version: v, buyer: name }), `Кто платил: ${name}`);
+  openPicker('Кто платил за «' + item.title + '»', walletList().map((p) => [p, walletLabel(p)]), async (name) => {
+    const saved = await optimistic(item, { buyer: name }, (v) => api('update', { id: item.id, version: v, buyer: name }));
+    const current = state.items.find((entry) => entry.id === item.id);
+    if (saved && current?.buyer === name && !writeChains.has(item.id)) toast(`Кто платил: ${name}`);
   });
 }
 
@@ -2137,10 +2155,12 @@ async function submitForm(e) {
   mainButtonBusy(true);
   const photo = form.photo ? { mime: form.photo.mime, base64: form.photo.base64 } : undefined;
   state.seq++;
+  state.pending++;
+  let failure;
   try {
     if (form.mode === 'edit') {
       const original = state.current;
-      await writeChains.get(original.id);
+      await writeChains.get(original.id)?.done;
       const item = state.items.find((i) => i.id === original.id) || original;
       const res = await api('update', Object.assign(data, { id: item.id, version: item.changedAt, photo, removePhoto: form.removePhoto }));
       if (res.item) Object.assign(item, res.item);
@@ -2185,8 +2205,9 @@ async function submitForm(e) {
       if (!res.item) loadItems({ silent: true, force: true }).catch(() => {});
     }
   } catch (ex) {
-    handleWriteError(ex, err);
+    failure = ex;
   } finally {
+    state.pending--;
     form.saving = false;
     if (state.form === form) {
       btn.disabled = false;
@@ -2194,6 +2215,8 @@ async function submitForm(e) {
       mainButtonBusy(false);
     }
   }
+  if (failure) await handleWriteError(failure, err);
+  if (state.reloadAfter) loadItems({ silent: true, force: true }).catch(() => {});
 }
 
 function deleteCurrent() {
