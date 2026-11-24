@@ -303,7 +303,7 @@ function show(view, { push = true } = {}) {
     const back = !push;
     ignoreScrollUntil = Date.now() + 150; // эту прокрутку делаем мы, а не палец
     window.scrollTo(0, back ? (scrollMemory[view] || 0) : 0);
-    animateView($('#view-' + view), back ? 'enter-back' : 'enter-forward');
+    if (view !== 'form') animateView($('#view-' + view), back ? 'enter-back' : 'enter-forward');
     if (view === 'list') updateStuck(); // вернулись на прокрученный список — тень панели сразу
   }
   if (tg && tg.BackButton) { if (view === 'list' && !(state.owner && state.ownerFrom)) tg.BackButton.hide(); else tg.BackButton.show(); }
@@ -1844,7 +1844,6 @@ function openSell() {
   $('#sell-error').textContent = '';
   updateSellProfit();
   $('#sell-sheet').hidden = false;
-  setTimeout(() => f.salePrice.focus(), 50);
 }
 
 function updateSellProfit() {
@@ -2019,7 +2018,6 @@ function openForm(mode, source) {
   }
   syncFormExtras();
   show('form');
-  if (mode === 'add' && !f.title.value) setTimeout(() => f.title.focus(), 80);
 }
 
 function syncFormExtras() {
@@ -2145,8 +2143,8 @@ async function submitForm(e) {
     const input = f.elements[name];
     err.textContent = message;
     input.classList.add('invalid');
+    input.focus({ preventScroll: true });
     input.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    setTimeout(() => input.focus({ preventScroll: true }), 250);
     haptic('error');
   };
   if (!data.title) { bad('title', 'Укажите название.'); return; }
@@ -2627,7 +2625,6 @@ function openMoney(kind, preset) {
   $('#money-error').textContent = '';
   $('#money-sheet').hidden = false;
   haptic('tap');
-  setTimeout(() => f.amount.focus(), 80);
 }
 
 async function submitMoney(e) {
