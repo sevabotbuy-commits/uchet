@@ -44,7 +44,7 @@ const DEFAULT_LISTS = {
   source: ['Выкуп', 'Комиссия'],
   authenticity: ['Не проверено', 'Проверено', 'Есть сомнения'],
   status: [STATUS.idea, STATUS.inTransit, STATUS.inStock, STATUS.reserved, STATUS.sold],
-  country: ['США', 'Европа', 'Китай', 'Корея', 'Япония'],
+  country: ['США', 'Европа', 'Китай', 'Корея', 'Япония', 'Россия'],
 };
 
 const state = {
@@ -162,7 +162,7 @@ function plannedGain(item) {
   return isNum(item.planPrice) && isNum(item.buyPrice) ? item.planPrice - item.buyPrice : null;
 }
 
-const COUNTRY_FLAGS = { 'США': '🇺🇸', 'Европа': '🇪🇺', 'Китай': '🇨🇳', 'Корея': '🇰🇷', 'Япония': '🇯🇵' };
+const COUNTRY_FLAGS = { 'США': '🇺🇸', 'Европа': '🇪🇺', 'Китай': '🇨🇳', 'Корея': '🇰🇷', 'Япония': '🇯🇵', 'Россия': '🇷🇺' };
 const withFlag = (c) => (c ? `${COUNTRY_FLAGS[c] ? COUNTRY_FLAGS[c] + ' ' : ''}${c}` : '');
 /** Сколько дней вещь лежит (для непроданных) или продавалась (для проданных). */
 function daysHeld(item) {
@@ -889,8 +889,8 @@ function bulkPick(field) {
   if (field === 'buyer') options = [...walletList().map((p) => [p, walletLabel(p)]), ['', '— не указано']];
   else if (field === 'status') options = [STATUS.inTransit, STATUS.inStock, STATUS.reserved].map((s) => [s, s]);
   else if (field === 'country') {
-    options = [...(state.lists.country || DEFAULT_LISTS.country).map((c) => [c, withFlag(c)]), ['', '— не указано']];
-  } else options = (state.lists.category || []).map((c) => [c, c]);
+    options = [...countryOptions().map((c) => [c, withFlag(c)]), ['', '— не указано']];
+  } else options = catalogOptions('category').map((c) => [c, c]);
   openPicker(`${BULK_LABELS[field]} — для ${pieces(n)}`, options, (value) => applyBulk(field, value));
 }
 
@@ -1889,10 +1889,10 @@ async function submitSell(e) {
 
 // ---------------------------------------------------------------- форма (добавить / изменить)
 
-const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'condition', 'country', 'source', 'authenticity', 'consignor',
-  'commissionPct', 'buyPrice', 'buyDate', 'buyer', 'seller', 'buyDoc', 'planPrice', 'notes'];
-const CLONE_FIELDS = ['title', 'category', 'brand', 'condition', 'country', 'source', 'authenticity', 'consignor',
-  'commissionPct', 'buyPrice', 'buyer', 'seller', 'buyDoc', 'planPrice'];
+const FORM_FIELDS = ['title', 'category', 'brand', 'size', 'country', 'source', 'consignor',
+  'commissionPct', 'buyPrice', 'buyDate', 'buyer', 'seller', 'planPrice', 'notes'];
+const CLONE_FIELDS = ['title', 'category', 'brand', 'country', 'source', 'consignor',
+  'commissionPct', 'buyPrice', 'buyer', 'seller', 'planPrice'];
 // Поля закупки — у комиссионных вещей их нет.
 const BUY_ONLY_FIELDS = ['buyPrice', 'buyer', 'seller'];
 
@@ -1918,23 +1918,36 @@ function fillPartnerSelect(sel, value) {
   setField(sel.form, sel.name, value);
 }
 
+const SIZE_OPTIONS = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'OS'];
+
+function countryOptions() {
+  return [...new Set([...(state.lists.country || DEFAULT_LISTS.country), 'Россия'])];
+}
+
+function catalogOptions(field) {
+  return [...new Set([...(state.lists[field] || []), ...state.items.map((item) => item[field])].filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, 'ru'));
+}
+
 function fillSelects() {
-  const dl = document.getElementById('dl-wallets');
-  if (dl) dl.replaceChildren(...walletList().map((n) => el('option', { value: n })));
+  $('#dl-wallets').replaceChildren(...walletList().map((n) => el('option', { value: n })));
+  const choices = {
+    partners: walletList(),
+    category: catalogOptions('category'),
+    brand: catalogOptions('brand'),
+    size: SIZE_OPTIONS,
+    country: countryOptions(),
+  };
   document.querySelectorAll('select[data-list]').forEach((sel) => {
-    const partners = sel.dataset.list === 'partners';
-    const values = partners ? walletList() : (state.lists[sel.dataset.list] || []);
+    const field = sel.dataset.list;
+    const values = choices[field] || state.lists[field] || [];
     const keep = sel.value;
     sel.replaceChildren(
-      el('option', { value: '' }, partners ? '— не указано' : '—'),
-      ...values.map((v) => el('option', { value: v }, partners ? walletLabel(v) : v)),
+      el('option', { value: '' }, field === 'partners' ? '— не указано' : '—'),
+      ...values.map((value) => el('option', { value }, value)),
     );
     sel.value = keep;
   });
-  const uniq = (arr) => [...new Set(arr.filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ru'));
-  $('#dl-category').replaceChildren(...uniq([...(state.lists.category || []), ...state.items.map((i) => i.category)])
-    .map((c) => el('option', { value: c })));
-  $('#dl-brand').replaceChildren(...uniq(state.items.map((i) => i.brand)).map((c) => el('option', { value: c })));
 }
 
 /** Ставит значение и в select добавляет вариант, если его нет в списке (данные из AppSheet). */
@@ -2001,7 +2014,6 @@ function openForm(mode, source) {
     (source ? CLONE_FIELDS : FORM_FIELDS).forEach((k) => setField(f, k, source && source[k]));
     f.buyDate.value = todayIso();
     if (!f.source.value && state.lists.source.includes('Выкуп')) f.source.value = 'Выкуп';
-    if (!f.authenticity.value && state.lists.authenticity.includes('Не проверено')) f.authenticity.value = 'Не проверено';
     f.status.value = state.tab === STATUS.inTransit || state.tab === STATUS.idea ? state.tab : STATUS.inStock;
     if (f.status.value === STATUS.idea) setField(f, 'buyer', ''); // присмотренную ещё не купили — платить некому
   }
@@ -2017,7 +2029,6 @@ function syncFormExtras() {
   $('#consignor-row').hidden = !commission;
   document.querySelectorAll('#item-form .buy-only').forEach((n) => { n.hidden = commission; });
   $('#buydate-label').textContent = commission ? 'Дата приёма' : 'Дата закупа';
-  $('#buydoc-label').textContent = commission ? 'Договор комиссии' : 'Документ закупа';
   $('#sale-row').hidden = f.status.value !== STATUS.sold;
   // «С какого бюджета оплачен» в продаже нужен, только если «Кто платил» не указан
   f.soldBy.closest('label').hidden = !!payeeOf({ source: f.source.value, buyer: f.buyer.value, consignor: f.consignor.value });
